@@ -1,0 +1,9 @@
+# Publish ONLY the userscript. Keep private notes/strategy off GitHub.
+BUGS.md
+PROJECT.md
+ROADMAP.md
+SETUP.md
+TESTING.md
+DESKTOP-TESTING.md
+xbs-*.json
+*.log
