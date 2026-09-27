@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X Bulk Scheduler
 // @namespace    x-bulk-scheduler
-// @version      0.4.5
+// @version      0.4.6
 // @description  Harvest video links from bookmarks/likes/official promo posts, prune dead links, and hand them to X's native scheduler. Mobile-friendly (Firefox Android + Tampermonkey).
 // @updateURL    https://raw.githubusercontent.com/eleven-smg/x-bulk-scheduler/main/src/x-bulk-scheduler.user.js
 // @downloadURL  https://raw.githubusercontent.com/eleven-smg/x-bulk-scheduler/main/src/x-bulk-scheduler.user.js
@@ -53,6 +53,17 @@
                             // now returns 402 (paywalled) — see BUGS.md 2026-09-23.
                             // Tombstone detection (Layer 1) is the free primary.
     timezone: 'Africa/Lagos',
+    // Like-bot (collection helper). Likes are used as a harvest surface: like the
+    // filtered search results, review/unlike by hand, then Harvest from Likes.
+    // GATED: obeys dryRun (default ON = preview only) AND asks once per page load
+    // before the first LIVE like. Paced + capped to keep YOUR account out of X's
+    // automation rate-limits — this is account-safety, not stealth.
+    like: {
+      cap: 50,            // default target per run (the number box overrides)
+      maxPerRun: 80,      // hard ceiling — a run never likes more than this
+      minGapMs: 1900,     // human-ish spacing between likes …
+      gapSpread: 2600,    // … + up to this much random extra (≈1.9–4.5s each)
+    },
     // Search-harvest defaults (Phase: search). X search operators.
     search: {
       minFaves: 1000,       // only videos with >= this many likes
@@ -69,6 +80,7 @@
       composerBox: '[data-testid="tweetTextarea_0"]',
       scheduleButton: '[data-testid="scheduleOption"]',
       tweetButton: '[data-testid="tweetButton"]',
+      likeButton: '[data-testid="like"]',     // unliked heart; becomes "unlike" once liked
       // Schedule picker (mapped on-device 2026-09-26). Native <select>s on the
       // x.com/compose/post/schedule route. Primary = X's ids; a heuristic
       // fallback (findScheduleSelects) recovers them if the ids ever change.
@@ -553,6 +565,67 @@
     log(`Shuffled ${pool.length} un-posted link(s) into a mixed order. Tap Build to re-schedule.`);
   }
 
+  // ------------------------------------------------------------- LIKE BOT
+  // Likes the posts currently in view (scrolling to load more) up to a cap, so
+  // the owner can use Likes as a collection surface: filter a search, Like N,
+  // then review/unlike by hand, then Harvest from Likes.
+  //
+  // SAFETY, honestly: automated bulk-liking is exactly what X's platform-
+  // manipulation systems watch for. Doing too many, too fast, risks YOUR account
+  // (rate-limit → temp lock → in the worst case suspension). So this is:
+  //   • OFF by default — obeys CONFIG.dryRun (preview-only until you flip it),
+  //   • confirmed once per page load before the first LIVE like,
+  //   • capped (never more than CONFIG.like.maxPerRun in a run),
+  //   • paced with human-ish gaps (NOT to evade anything — to stay under limits).
+  // A search for a name also surfaces OTHER people's posts, so it will like some
+  // accounts that aren't your client — tighten the search filters first, and the
+  // review-then-unlike step is your safety net.
+  let LIKING = false;
+
+  async function likeVisible(targetN) {
+    if (LIKING) { log('Already liking.', 'warn'); return; }
+    const want = Math.min(Number(targetN) > 0 ? Number(targetN) : CONFIG.like.cap, CONFIG.like.maxPerRun);
+    if (!/\/search/.test(location.pathname)) {
+      log('Tip: run Like on a SEARCH results page you have filtered. Continuing on this page anyway.', 'warn');
+    }
+    if (!CONFIG.dryRun && !likeVisible._ok) {
+      const ok = window.confirm(
+        `LIKE BOT — live mode\n\nAbout to LIKE up to ${want} posts in view, ~1.9–4.5s apart.\n\n` +
+        `These are REAL likes on other people's posts and count as automation, ` +
+        `which can get your account rate-limited or locked. Only proceed on a ` +
+        `search you've filtered to your client's content.\n\nProceed?`);
+      if (!ok) { log('Like cancelled.', 'warn'); return; }
+      likeVisible._ok = true; // confirmed for the rest of this page load
+    }
+    LIKING = true;
+    log(`${CONFIG.dryRun ? '[dryRun] ' : ''}liking up to ${want} post(s)…`);
+    let liked = 0, stable = 0;
+    try {
+      while (liked < want && stable < 4 && LIKING) {
+        const btns = [...document.querySelectorAll(`${CONFIG.selectors.article} ${CONFIG.selectors.likeButton}`)];
+        let clicked = 0;
+        for (const b of btns) {
+          if (!LIKING || liked >= want) break;
+          const art = b.closest(CONFIG.selectors.article);
+          const own = art ? articleOwnId(art) : null;
+          const tag = own ? own.id : '?';
+          if (CONFIG.dryRun) {
+            log(`[dryRun] would like ${tag} (${liked + 1}/${want})`);
+          } else {
+            b.click();
+            log(`liked ${tag} (${liked + 1}/${want})`);
+          }
+          liked++; clicked++;
+          await sleep(jitter(CONFIG.like.minGapMs, CONFIG.like.gapSpread));
+        }
+        stable = clicked === 0 ? stable + 1 : 0;
+        window.scrollBy(0, window.innerHeight * 0.9);
+        await sleep(jitter(900, 500));
+      }
+      log(`${CONFIG.dryRun ? '[dryRun] ' : ''}Like run done: ${liked} post(s)${liked >= want ? '' : ' (ran out / stopped)'}. Review & unlike any you don't want, then Harvest from Likes.`);
+    } finally { LIKING = false; }
+  }
+
   // --------------------------------------------------------- SCHEDULE (math)
   // Pure, local, no DOM, no network. Splits queued items into day/session/slot
   // and stamps each with a WAT timestamp. Idempotent: re-runnable any time.
@@ -758,6 +831,7 @@
   function panic() {
     RUNNING = false;
     RESOLVING = false;
+    LIKING = false;
     log('PANIC: run halted. In-flight items left as-is.', 'warn');
   }
 
@@ -1000,6 +1074,12 @@
           <button data-a="fixlinks" style="flex:2;background:#268">Fix Links (wrapper→original)</button>
           <button data-a="shuffle"  style="flex:1;background:#725">Shuffle</button>
         </div>
+        <div style="display:flex;gap:4px;margin-bottom:6px;align-items:center">
+          <button data-a="like" style="flex:2;background:#b25">Like search</button>
+          <input id="xbs-liken" type="number" min="1" inputmode="numeric" placeholder="50"
+            title="How many posts in view to like (default 50). Run this on a SEARCH page you've filtered. Obeys dryRun — flip dryRun off to actually like."
+            style="width:46px;background:#0b1015;color:#fff;border:1px solid #38444d;border-radius:6px;padding:2px 4px;text-align:center"/>
+        </div>
         <div style="display:flex;gap:4px;margin-bottom:6px">
           <button data-a="status" style="flex:1">Status</button>
           <button data-a="clear"  style="flex:1">Clear-Q</button>
@@ -1030,6 +1110,8 @@
       build: buildSchedule, run: runSchedule, stop: panic,
       fixlinks: resolveQueueLinks,
       shuffle: shuffleQueue,
+      like: () => { const el = document.getElementById('xbs-liken');
+        likeVisible(el && el.value ? Number(el.value) : 0); },
       status: () => log(statusSummary()),
       clear: clearQueued,
       export: exportQueue,
