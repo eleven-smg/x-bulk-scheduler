@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X Bulk Scheduler
 // @namespace    x-bulk-scheduler
-// @version      0.7.0
+// @version      0.8.0
 // @description  Harvest video links from bookmarks/likes/official promo posts, prune dead links, and hand them to X's native scheduler. Mobile-friendly (Firefox Android + Tampermonkey).
 // @updateURL    https://raw.githubusercontent.com/eleven-smg/x-bulk-scheduler/main/src/x-bulk-scheduler.user.js
 // @downloadURL  https://raw.githubusercontent.com/eleven-smg/x-bulk-scheduler/main/src/x-bulk-scheduler.user.js
@@ -598,18 +598,16 @@
   }
 
   // ------------------------------------------------------------- SHUFFLE
-  // Mixes the un-posted pool so the posting timeline is varied instead of
-  // running in harvest order (where the same account/batch sits back-to-back).
-  // Only 'queued' items are touched — anything already scheduled/posted/dead is
-  // left where it is. Build reads the 'queued' items IN ARRAY ORDER, so simply
-  // reordering them here decides the posting order.
-  //
-  // A uniform Fisher-Yates shuffle is exactly the "spread across the whole pool"
-  // the owner asked for: after it, any run of ~10 in the new order is a random
-  // sample from the entire pool (e.g. 1, 15, 23, 37, 42… — never the 1,11,21…
-  // fixed stride, and never a single clumped batch). A second best-effort pass
-  // then nudges apart any two neighbours from the SAME account so you don't post
-  // the same creator twice in a row.
+  // Mixes the un-posted pool so the posting timeline is varied instead of running
+  // in harvest order (where the same account/batch sits back-to-back). Only
+  // 'queued' items are touched; Build reads them IN ARRAY ORDER, so reordering
+  // here decides the posting order. Two modes:
+  //   • Free Shuffle   — uniform Fisher-Yates over the whole pool (no value).
+  //   • Spread Shuffle — value-based (groups of N): deals across groups so links
+  //     that were near each other in your Likes end up far apart. See
+  //     spreadShuffleQueue() below.
+  // Both finish with a best-effort pass that nudges apart any two neighbours from
+  // the SAME account so you don't post the same creator twice in a row.
   const authorOf = (x) =>
     (String(x.url || '').match(/(?:x|twitter)\.com\/([^/]+)\/status/) || [])[1] ||
     x.source || '';
@@ -627,23 +625,68 @@
   }
 
   function shuffleQueue() {
+    const pr = shufflePoolRest();
+    if (!pr) return;
+    fisherYates(pr.pool);
+    commitShuffle(pr.pool, pr.rest,
+      `Free-shuffled ${pr.pool.length} un-posted link(s) into a random order. Tap Build to re-schedule.`);
+  }
+
+  // Shared: pull the schedulable un-posted pool out of the queue. Parked photos
+  // stay in `rest` when Mix Pics is OFF; when ON they're part of the pool.
+  function shufflePoolRest() {
     const q = store.getQueue();
-    // Only shuffle the schedulable pool. When Mix Pics is OFF, parked photos are
-    // left untouched in `rest`; when ON, they're part of the pool and get mixed in.
     const pool = q.filter((x) => x.state === 'queued' && isSchedulable(x));
     const rest = q.filter((x) => !(x.state === 'queued' && isSchedulable(x)));
-    if (pool.length < 2) { log('Nothing to shuffle — need 2+ un-posted, schedulable links in the pool.', 'warn'); return; }
-    // Fisher-Yates over the un-posted pool.
-    for (let i = pool.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      const t = pool[i]; pool[i] = pool[j]; pool[j] = t;
+    if (pool.length < 2) {
+      log('Nothing to shuffle — need 2+ un-posted, schedulable links in the pool.', 'warn');
+      return null;
     }
+    return { pool, rest };
+  }
+  function fisherYates(a) {
+    for (let i = a.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      const t = a[i]; a[i] = a[j]; a[j] = t;
+    }
+  }
+  // Commit a freshly-ordered pool as the new posting order + best-effort same-
+  // author spacing. A re-shuffle invalidates any stamped schedule, so clear it —
+  // Build re-lays the whole pool in the new order.
+  function commitShuffle(pool, rest, msg) {
     spreadSameAuthor(pool);
-    // A re-shuffle invalidates any schedule already stamped — clear it so Build
-    // re-lays the whole pool in the new order.
     pool.forEach((x) => { x.scheduledAt = null; x.day = 0; x.session = 0; x.slot = 0; });
     store.setQueue([...rest, ...pool]);
-    log(`Shuffled ${pool.length} un-posted link(s) into a mixed order. Tap Build to re-schedule.`);
+    log(msg);
+  }
+
+  // SPREAD shuffle (by group size N) — for when similar likes sit in runs (e.g.
+  // 15–20 similar posts in a row). Splits the pool into consecutive groups of N in
+  // harvest order (group A = links 1..N, group B = N+1..2N, …), shuffles inside
+  // each group AND the group order, then DEALS one link at a time from a different
+  // group each step (like dealing cards off several piles), re-randomising the
+  // group order every pass. Result: links that were near each other end up far
+  // apart, and the sequence is still random — NOT a fixed "1..10 then 11..20"
+  // order, but e.g. one from 1..10, then 61..70, then 91..100, then 51..60…
+  // Smaller N = more groups = similar links spread wider.
+  function spreadShuffleQueue(groupSize) {
+    const pr = shufflePoolRest();
+    if (!pr) return;
+    const n = Math.max(2, Math.floor(Number(groupSize) || 10));
+    const { pool, rest } = pr;
+    const groups = [];
+    for (let i = 0; i < pool.length; i += n) groups.push(pool.slice(i, i + n));
+    groups.forEach(fisherYates);   // shuffle within each group
+    fisherYates(groups);           // shuffle the group order
+    const out = [];
+    let live = groups.filter((g) => g.length);
+    while (live.length) {
+      fisherYates(live);           // re-randomise which group we jump to each pass
+      for (const g of live) out.push(g.shift());
+      live = live.filter((g) => g.length);
+    }
+    commitShuffle(out, rest,
+      `Spread-shuffled ${out.length} link(s) in ${groups.length} group(s) of ${n} — similar/adjacent links pulled apart. Tap Build to re-schedule.`);
   }
 
   // ------------------------------------------------------------- LIKE BOT
@@ -1068,6 +1111,16 @@
       const afterIds = store.getQueue().map((x) => x.id);
       ok('shuffle keeps every id', eqSet(beforeIds, afterIds));
       ok('shuffle no dupes', new Set(afterIds).size === afterIds.length);
+      // -- spread shuffle: permutation + strong diversification (groups of 10) --
+      const tagged = big.map((x, i) => ({ ...x, grp: Math.floor(i / 10),
+        state: 'queued', scheduledAt: null }));
+      store.setQueue(tagged); CONFIG.mixPictures = true; spreadShuffleQueue(10);
+      const outQ = store.getQueue();
+      ok('spread keeps every id', eqSet(beforeIds, outQ.map((x) => x.id)));
+      ok('spread no dupes', new Set(outQ.map((x) => x.id)).size === outQ.length);
+      let sameGrpAdj = 0;
+      for (let i = 1; i < outQ.length; i++) if (outQ[i].grp === outQ[i - 1].grp) sameGrpAdj++;
+      ok('spread separates original groups', sameGrpAdj <= 8); // random baseline ~10
       // -- spreadSameAuthor separates a solvable case --
       const sp = [{ url: 'x.com/a/status/1' }, { url: 'x.com/a/status/2' },
         { url: 'x.com/b/status/3' }, { url: 'x.com/c/status/4' }];
@@ -1344,8 +1397,16 @@
           <button data-a="run"     style="flex:1">Run</button>
         </div>
         <div style="display:flex;gap:4px;margin-bottom:6px">
-          <button data-a="fixlinks" style="flex:2;background:#268">Fix Links (wrapper→original)</button>
-          <button data-a="shuffle"  style="flex:1;background:#725">Shuffle</button>
+          <button data-a="fixlinks" style="flex:1;background:#268">Fix Links (wrapper→original)</button>
+        </div>
+        <div style="display:flex;gap:4px;margin-bottom:6px;align-items:center">
+          <button data-a="shuffle" style="flex:2;background:#725"
+            title="Free Shuffle: fully random reorder of the whole pool (no value used).">Free Shuffle</button>
+          <button data-a="spread" style="flex:2;background:#537"
+            title="Spread Shuffle: uses the number box. Splits links into groups of N in the order you liked them, then deals one from a different group at a time so similar/adjacent likes land far apart.">Spread Shuffle</button>
+          <input id="xbs-shufn" type="number" min="2" inputmode="numeric" placeholder="10"
+            title="Spread Shuffle group size (default 10). Bigger = bigger groups; smaller spreads similar links wider apart."
+            style="width:46px;background:#0b1015;color:#fff;border:1px solid #38444d;border-radius:6px;padding:2px 4px;text-align:center"/>
         </div>
         <div style="display:flex;gap:4px;margin-bottom:6px;align-items:center">
           <button data-a="like" style="flex:2;background:#b25">Like search</button>
@@ -1390,6 +1451,8 @@
       build: buildSchedule, run: runSchedule, stop: panic,
       fixlinks: resolveQueueLinks,
       shuffle: shuffleQueue,
+      spread: () => { const el = document.getElementById('xbs-shufn');
+        spreadShuffleQueue(el && el.value ? Number(el.value) : 10); },
       like: () => { const el = document.getElementById('xbs-liken');
         likeVisible(el && el.value ? Number(el.value) : 0); },
       status: () => log(statusSummary()),
@@ -1465,9 +1528,10 @@
   // selfTest() off-device, so bugs are caught before the script ever hits X.
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
-      CONFIG, store, selfTest, buildSchedule, shuffleQueue, spreadSameAuthor,
-      authorOf, isSchedulable, isPhotoItem, buildSearchUrl, synToken,
-      originalFromSyndication, isTombstone, buildUrl, extractStatusId, statusSummary,
+      CONFIG, store, selfTest, buildSchedule, shuffleQueue, spreadShuffleQueue,
+      spreadSameAuthor, authorOf, isSchedulable, isPhotoItem, buildSearchUrl,
+      synToken, originalFromSyndication, isTombstone, buildUrl, extractStatusId,
+      statusSummary,
     };
   }
 })();
