@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X Bulk Scheduler
 // @namespace    x-bulk-scheduler
-// @version      0.4.4
+// @version      0.4.5
 // @description  Harvest video links from bookmarks/likes/official promo posts, prune dead links, and hand them to X's native scheduler. Mobile-friendly (Firefox Android + Tampermonkey).
 // @updateURL    https://raw.githubusercontent.com/eleven-smg/x-bulk-scheduler/main/src/x-bulk-scheduler.user.js
 // @downloadURL  https://raw.githubusercontent.com/eleven-smg/x-bulk-scheduler/main/src/x-bulk-scheduler.user.js
@@ -506,6 +506,53 @@
     } finally { RESOLVING = false; }
   }
 
+  // ------------------------------------------------------------- SHUFFLE
+  // Mixes the un-posted pool so the posting timeline is varied instead of
+  // running in harvest order (where the same account/batch sits back-to-back).
+  // Only 'queued' items are touched — anything already scheduled/posted/dead is
+  // left where it is. Build reads the 'queued' items IN ARRAY ORDER, so simply
+  // reordering them here decides the posting order.
+  //
+  // A uniform Fisher-Yates shuffle is exactly the "spread across the whole pool"
+  // the owner asked for: after it, any run of ~10 in the new order is a random
+  // sample from the entire pool (e.g. 1, 15, 23, 37, 42… — never the 1,11,21…
+  // fixed stride, and never a single clumped batch). A second best-effort pass
+  // then nudges apart any two neighbours from the SAME account so you don't post
+  // the same creator twice in a row.
+  const authorOf = (x) =>
+    (String(x.url || '').match(/(?:x|twitter)\.com\/([^/]+)\/status/) || [])[1] ||
+    x.source || '';
+
+  function spreadSameAuthor(a) {
+    // Pure swaps only — never adds or drops an item.
+    for (let i = 1; i < a.length; i++) {
+      if (authorOf(a[i]) !== authorOf(a[i - 1])) continue;
+      let swap = -1;
+      for (let k = i + 1; k < a.length; k++) {
+        if (authorOf(a[k]) !== authorOf(a[i - 1])) { swap = k; break; }
+      }
+      if (swap > -1) { const t = a[i]; a[i] = a[swap]; a[swap] = t; }
+    }
+  }
+
+  function shuffleQueue() {
+    const q = store.getQueue();
+    const pool = q.filter((x) => x.state === 'queued');
+    const rest = q.filter((x) => x.state !== 'queued');
+    if (pool.length < 2) { log('Nothing to shuffle — need 2+ un-posted links in the pool.', 'warn'); return; }
+    // Fisher-Yates over the un-posted pool.
+    for (let i = pool.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      const t = pool[i]; pool[i] = pool[j]; pool[j] = t;
+    }
+    spreadSameAuthor(pool);
+    // A re-shuffle invalidates any schedule already stamped — clear it so Build
+    // re-lays the whole pool in the new order.
+    pool.forEach((x) => { x.scheduledAt = null; x.day = 0; x.session = 0; x.slot = 0; });
+    store.setQueue([...rest, ...pool]);
+    log(`Shuffled ${pool.length} un-posted link(s) into a mixed order. Tap Build to re-schedule.`);
+  }
+
   // --------------------------------------------------------- SCHEDULE (math)
   // Pure, local, no DOM, no network. Splits queued items into day/session/slot
   // and stamps each with a WAT timestamp. Idempotent: re-runnable any time.
@@ -950,7 +997,8 @@
           <button data-a="run"     style="flex:1">Run</button>
         </div>
         <div style="display:flex;gap:4px;margin-bottom:6px">
-          <button data-a="fixlinks" style="flex:1;background:#268">Fix Links (wrapper→original)</button>
+          <button data-a="fixlinks" style="flex:2;background:#268">Fix Links (wrapper→original)</button>
+          <button data-a="shuffle"  style="flex:1;background:#725">Shuffle</button>
         </div>
         <div style="display:flex;gap:4px;margin-bottom:6px">
           <button data-a="status" style="flex:1">Status</button>
@@ -981,6 +1029,7 @@
         harvest(el && el.value ? Number(el.value) : 0); },
       build: buildSchedule, run: runSchedule, stop: panic,
       fixlinks: resolveQueueLinks,
+      shuffle: shuffleQueue,
       status: () => log(statusSummary()),
       clear: clearQueued,
       export: exportQueue,
