@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X Bulk Scheduler
 // @namespace    x-bulk-scheduler
-// @version      0.6.0
+// @version      0.7.0
 // @description  Harvest video links from bookmarks/likes/official promo posts, prune dead links, and hand them to X's native scheduler. Mobile-friendly (Firefox Android + Tampermonkey).
 // @updateURL    https://raw.githubusercontent.com/eleven-smg/x-bulk-scheduler/main/src/x-bulk-scheduler.user.js
 // @downloadURL  https://raw.githubusercontent.com/eleven-smg/x-bulk-scheduler/main/src/x-bulk-scheduler.user.js
@@ -977,6 +977,120 @@
     ].join('\n');
   }
 
+  // ------------------------------------------------------------- SELF-TEST
+  // Runs the PURE logic — schedule math, shuffle/spread, picture parking,
+  // search-URL builder, syndication parsing, dead-link regex, id/url helpers —
+  // against synthetic data and reports PASS/FAIL in the panel log. It touches NO
+  // X page, makes NO network calls, and posts/likes NOTHING. It snapshots your
+  // real queue + settings and RESTORES them in a finally, so it never disturbs
+  // your pool. (The DOM-dependent parts — like button, composer, picker, harvest
+  // scan — can't be checked off the live page; those stay the on-device dryRun
+  // tests + Probe.) Safe to tap anytime.
+  function selfTest() {
+    const results = [];
+    const ok = (name, cond) => results.push({ name, pass: !!cond });
+    const eqSet = (a, b) => a.length === b.length && a.every((x) => b.includes(x));
+    const snap = {
+      queue: GM_getValue(KEYS.queue, '[]'),
+      posted: GM_getValue(KEYS.posted, '[]'),
+      settings: GM_getValue(KEYS.settings, '{}'),
+      active: CONFIG.active, mix: CONFIG.mixPictures, days: CONFIG.daysAhead,
+      cap: CONFIG.dailyCap, start: CONFIG.startTime,
+    };
+    try {
+      // -- id / url helpers --
+      ok('extractStatusId', extractStatusId('/bob/status/12345/video/1') === '12345');
+      ok('buildUrl video', buildUrl('123', 'bob', 'video').endsWith('/bob/status/123/video/1'));
+      ok('buildUrl photo', buildUrl('123', 'bob', 'photo').endsWith('/bob/status/123/photo/1'));
+      ok('authorOf', authorOf({ url: 'https://x.com/alice/status/1' }) === 'alice');
+      // -- filtered search URL --
+      const su = decodeURIComponent(buildSearchUrl('rosemary'));
+      ok('search term', su.includes('rosemary'));
+      ok('search native_video', su.includes('filter:native_video'));
+      ok('search min_faves', su.includes('min_faves:1000'));
+      // -- syndication (wrapper -> original) parsing --
+      ok('syn quoted', (() => { const r = originalFromSyndication(
+        { quoted_tweet: { id_str: '999', user: { screen_name: 'og' } } }, '111');
+        return r && r.id === '999' && r.author === 'og'; })());
+      ok('syn media source', (() => { const r = originalFromSyndication(
+        { mediaDetails: [{ source_status_id_str: '888',
+          additional_media_info: { source_user: { screen_name: 'src' } } }] }, '111');
+        return r && r.id === '888' && r.author === 'src'; })());
+      ok('syn native -> null', originalFromSyndication({ full_text: 'hi' }, '111') === null);
+      ok('syn same-id -> null', originalFromSyndication({ quoted_tweet: { id_str: '111' } }, '111') === null);
+      ok('synToken format', (() => { const t = synToken('1234567890123456789');
+        return typeof t === 'string' && t.length > 0 && !/[0.]/.test(t); })());
+      // -- dead-link (tombstone) regex --
+      const fakeArt = (txt, hasVideo) => ({
+        querySelector: (s) => (hasVideo && /video/i.test(s)) ? {} : null, innerText: txt });
+      ok('tombstone dead', isTombstone(fakeArt('This post was deleted.', false)) === true);
+      ok('tombstone alive', isTombstone(fakeArt('This post was deleted.', true)) === false);
+      // -- picture parking / isSchedulable --
+      CONFIG.mixPictures = false;
+      ok('park photo (mix off)', isSchedulable({ media: 'video' }) === true
+        && isSchedulable({ media: 'photo' }) === false);
+      CONFIG.mixPictures = true;
+      ok('mix photo (mix on)', isSchedulable({ media: 'photo' }) === true);
+      // -- schedule math (large pool, cap) --
+      CONFIG.active = '12x4'; CONFIG.daysAhead = 1; CONFIG.dailyCap = 48;
+      CONFIG.startTime = '00:00'; CONFIG.mixPictures = false;
+      const p = CONFIG.presets['12x4'];
+      const perDay = p.postsPerSession * p.sessions;                 // 48
+      const mk = (i, media) => ({ id: 'T' + i, url: `https://x.com/u${i % 5}/status/${i}`,
+        kind: 'link', media, state: 'queued', day: 0, session: 0, slot: 0,
+        scheduledAt: null, source: 'selftest', errors: [] });
+      const big = []; for (let i = 0; i < 50; i++) big.push(mk(i, 'video'));
+      store.setQueue(big); buildSchedule();
+      let q2 = store.getQueue();
+      const built = q2.filter((x) => x.scheduledAt);
+      ok('build caps at perDay', built.length === Math.min(50, perDay));
+      ok('build all day 0', q2.filter((x) => x.scheduledAt && x.day === 0).length === built.length);
+      ok('build session boundary', built[12] && built[12].session === 1 && built[12].slot === 0);
+      ok('build last slot', built[47] && built[47].session === 3 && built[47].slot === 11);
+      // -- picture parking through Build (small pool) --
+      const small = [mk(1, 'video'), mk(2, 'video'), mk(3, 'video'), mk(4, 'video'),
+        mk(900, 'photo'), mk(901, 'photo')];
+      CONFIG.mixPictures = false;
+      store.setQueue(small.map((x) => ({ ...x }))); buildSchedule();
+      q2 = store.getQueue();
+      ok('build parks photos (mix off)',
+        q2.filter((x) => x.media === 'video' && x.scheduledAt).length === 4
+        && q2.filter((x) => x.media === 'photo' && x.scheduledAt).length === 0);
+      CONFIG.mixPictures = true;
+      store.setQueue(small.map((x) => ({ ...x }))); buildSchedule();
+      q2 = store.getQueue();
+      ok('build mixes photos (mix on)',
+        q2.filter((x) => x.media === 'photo' && x.scheduledAt).length === 2);
+      // -- shuffle: permutation, no loss/dupes --
+      const beforeIds = big.map((x) => x.id);
+      store.setQueue(big.map((x) => ({ ...x, state: 'queued', scheduledAt: null })));
+      CONFIG.mixPictures = true; shuffleQueue();
+      const afterIds = store.getQueue().map((x) => x.id);
+      ok('shuffle keeps every id', eqSet(beforeIds, afterIds));
+      ok('shuffle no dupes', new Set(afterIds).size === afterIds.length);
+      // -- spreadSameAuthor separates a solvable case --
+      const sp = [{ url: 'x.com/a/status/1' }, { url: 'x.com/a/status/2' },
+        { url: 'x.com/b/status/3' }, { url: 'x.com/c/status/4' }];
+      spreadSameAuthor(sp);
+      let adj = 0; for (let i = 1; i < sp.length; i++)
+        if (authorOf(sp[i]) === authorOf(sp[i - 1])) adj++;
+      ok('spread separates authors', adj === 0);
+    } catch (e) {
+      results.push({ name: 'EXCEPTION: ' + (e && e.message || e), pass: false });
+    } finally {
+      GM_setValue(KEYS.queue, snap.queue);
+      GM_setValue(KEYS.posted, snap.posted);
+      GM_setValue(KEYS.settings, snap.settings);
+      CONFIG.active = snap.active; CONFIG.mixPictures = snap.mix;
+      CONFIG.daysAhead = snap.days; CONFIG.dailyCap = snap.cap; CONFIG.startTime = snap.start;
+    }
+    const passed = results.filter((r) => r.pass).length;
+    const failed = results.filter((r) => !r.pass);
+    log(`Self-Test: ${passed}/${results.length} passed${failed.length ? '' : ' — all green, your pool untouched.'}`);
+    failed.forEach((r) => log(`  FAIL: ${r.name}`, 'warn'));
+    return { passed, total: results.length, failed: failed.map((r) => r.name) };
+  }
+
   // "Timing" button — edit the schedule shape without touching code (owner is
   // non-technical). prompt()-based so it works on mobile; persists via saveSettings.
   function editTiming() {
@@ -1263,6 +1377,7 @@
           <button data-a="reset"   style="flex:1;background:#a01">Reset (re-harvest)</button>
         </div>
         <div style="display:flex;gap:4px;margin-bottom:6px">
+          <button data-a="selftest" style="flex:1;background:#26a">Self-Test (logic)</button>
           <button data-a="probe" style="flex:1;background:#1a6">Probe (run tests)</button>
         </div>
         <pre id="xbs-log" style="height:120px;overflow:auto;background:#0b1015;margin:0;padding:4px;border-radius:6px;white-space:pre-wrap"></pre>
@@ -1282,6 +1397,7 @@
       clear: clearQueued,
       reset: resetHarvest,
       search: openSearch,
+      selftest: selfTest,
       export: exportQueue,
       import: importQueue,
       captions: () => {
@@ -1343,4 +1459,15 @@
   // Re-attach panel across X's client-side navigations.
   new MutationObserver(() => { if (!document.getElementById('xbs-panel')) buildPanel(); })
     .observe(document.documentElement, { childList: true, subtree: true });
+
+  // Test hook — a NO-OP under Tampermonkey (module is undefined there). Lets the
+  // local node harness (test/selftest.node.js) import the pure logic and run
+  // selfTest() off-device, so bugs are caught before the script ever hits X.
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = {
+      CONFIG, store, selfTest, buildSchedule, shuffleQueue, spreadSameAuthor,
+      authorOf, isSchedulable, isPhotoItem, buildSearchUrl, synToken,
+      originalFromSyndication, isTombstone, buildUrl, extractStatusId, statusSummary,
+    };
+  }
 })();
