@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X Bulk Scheduler
 // @namespace    x-bulk-scheduler
-// @version      0.5.0
+// @version      0.6.0
 // @description  Harvest video links from bookmarks/likes/official promo posts, prune dead links, and hand them to X's native scheduler. Mobile-friendly (Firefox Android + Tampermonkey).
 // @updateURL    https://raw.githubusercontent.com/eleven-smg/x-bulk-scheduler/main/src/x-bulk-scheduler.user.js
 // @downloadURL  https://raw.githubusercontent.com/eleven-smg/x-bulk-scheduler/main/src/x-bulk-scheduler.user.js
@@ -44,9 +44,15 @@
     startTime: '00:00',     // first session each day, WAT (Nigeria, UTC+1)
     daysAhead: 1,           // how many days to schedule per run (queue-cap safety)
     appendVideoSuffix: true,// append /video/1 (or /photo/1) to harvested links
-    harvestPhotos: false,   // also harvest photo posts (suffix /photo/1). Toggle
-                            // from the panel's "Photos" button. OFF by default so
-                            // video-only pages behave exactly as before.
+    harvestPhotos: false,   // COLLECT photo posts during Harvest (suffix /photo/1).
+                            // Toggle from the panel's "Photos" button; persists.
+                            // OFF = video-only harvest (original behaviour).
+    mixPictures: false,     // What to DO with harvested photos at schedule time.
+                            // OFF (default) = photo links are a SEPARATE, PARKED
+                            //   pool: saved but never Built/Scheduled. Videos only.
+                            // ON = mix the photo pool INTO the schedule alongside
+                            //   videos (Build/Shuffle include them). Toggle from
+                            //   the panel's "Mix Pics" button; persists.
     dryRun: true,           // TRUE = log actions only, never click final Confirm
     dailyCap: 48,           // stop scheduling past this many/day (free-tier ~50)
     unbookmarkAfterPost: true, // once a BOOKMARKED item is scheduled, remove it
@@ -132,7 +138,7 @@
   // panel are persisted here and re-applied at startup. Only these whitelisted
   // fields are user-editable from the panel (never dryRun — going live stays a
   // deliberate code change so nothing posts by accident).
-  const SETTABLE = ['active', 'startTime', 'daysAhead', 'dailyCap'];
+  const SETTABLE = ['active', 'startTime', 'daysAhead', 'dailyCap', 'harvestPhotos', 'mixPictures'];
   function loadSettings() {
     let s = {};
     try { s = JSON.parse(GM_getValue(KEYS.settings, '{}')) || {}; } catch (e) { s = {}; }
@@ -393,7 +399,53 @@
     const removed = q.length - kept.length;
     store.setQueue(kept);
     GM_setValue(KEYS.lasthv, JSON.stringify({ at: new Date().toISOString(), source: null, ids: [] }));
-    log(`Cleared ${removed} queued item(s). Scheduled/posted kept.`);
+    log(`Cleared ${removed} queued item(s) (incl. any parked pictures). Scheduled/posted kept.`);
+  }
+
+  // FULL reset of harvest memory. Clear-Q only drops un-built items but the
+  // dedupe checkpoint (already-harvested + posted ids) still makes Harvest SKIP
+  // everything it saw before — so "re-harvest all my likes" needs this. It wipes
+  // the whole queue AND that checkpoint, so the next Harvest re-collects your
+  // entire Likes/Bookmarks list from scratch. Captions are kept. Destructive to
+  // the "already done" memory: with dryRun ON nothing was ever posted so it's
+  // safe now; once you go live, forgetting posted-ids means it could re-schedule
+  // posts you already sent — so this always asks first.
+  function resetHarvest() {
+    const q = store.getQueue();
+    const posted = store.getPosted().size;
+    const ok = window.confirm(
+      `RE-HARVEST RESET\n\nDelete ALL ${q.length} queued/built item(s) AND forget the ` +
+      `${posted} already-harvested/posted id(s)?\n\nThe next Harvest will then re-collect your ` +
+      `whole Likes/Bookmarks list from the top. Captions are kept.\n\nProceed?`);
+    if (!ok) { log('Reset cancelled — nothing changed.', 'warn'); return; }
+    store.setQueue([]);
+    GM_setValue(KEYS.posted, '[]');
+    GM_setValue(KEYS.lasthv, JSON.stringify({ at: new Date().toISOString(), source: null, ids: [] }));
+    log(`Reset done: queue emptied, ${posted} harvested-id(s) forgotten. Harvest again to re-collect everything.`);
+  }
+
+  // ------------------------------------------------------------- SEARCH
+  // Build a filtered X search URL from CONFIG.search (popular native videos by
+  // keyword) and open it. From there you can Like the results (collection), then
+  // review/unlike and Harvest from your Likes. Pure navigation — posts nothing.
+  function buildSearchUrl(term) {
+    const s = CONFIG.search;
+    const parts = [String(term || '').trim()];
+    if (s.onlyNativeVideo) parts.push('filter:native_video');
+    if (s.excludeReplies) parts.push('-filter:replies');
+    if (s.minFaves > 0) parts.push(`min_faves:${s.minFaves}`);
+    if (s.lang) parts.push(`lang:${s.lang}`);
+    return `https://x.com/search?q=${encodeURIComponent(parts.filter(Boolean).join(' '))}&f=live`;
+  }
+  function openSearch() {
+    const term = prompt(
+      `Search keyword (e.g. your client's name).\nWill be filtered to native videos`
+      + `${CONFIG.search.minFaves ? ` with ≥${CONFIG.search.minFaves} likes` : ''}`
+      + `${CONFIG.search.excludeReplies ? ', no replies' : ''}.`);
+    if (term === null) return;
+    const url = buildSearchUrl(term);
+    log(`Opening filtered search: q="${decodeURIComponent(url.split('q=')[1].split('&')[0])}" (Latest tab). Then tap Like search, or Harvest from your Likes after.`);
+    location.assign(url);
   }
 
   // Read-only DOM dump of the first few posts in the current view: own id, every
@@ -576,9 +628,11 @@
 
   function shuffleQueue() {
     const q = store.getQueue();
-    const pool = q.filter((x) => x.state === 'queued');
-    const rest = q.filter((x) => x.state !== 'queued');
-    if (pool.length < 2) { log('Nothing to shuffle — need 2+ un-posted links in the pool.', 'warn'); return; }
+    // Only shuffle the schedulable pool. When Mix Pics is OFF, parked photos are
+    // left untouched in `rest`; when ON, they're part of the pool and get mixed in.
+    const pool = q.filter((x) => x.state === 'queued' && isSchedulable(x));
+    const rest = q.filter((x) => !(x.state === 'queued' && isSchedulable(x)));
+    if (pool.length < 2) { log('Nothing to shuffle — need 2+ un-posted, schedulable links in the pool.', 'warn'); return; }
     // Fisher-Yates over the un-posted pool.
     for (let i = pool.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
@@ -657,13 +711,26 @@
   }
 
   // --------------------------------------------------------- SCHEDULE (math)
+  // Photo links are a SEPARATE pool from videos. A photo is only eligible for
+  // scheduling when CONFIG.mixPictures is ON; otherwise it stays parked (saved,
+  // never Built/Run). Captions and video links are always schedulable.
+  const isPhotoItem = (x) => x.media === 'photo';
+  const isSchedulable = (x) => !isPhotoItem(x) || CONFIG.mixPictures;
+
   // Pure, local, no DOM, no network. Splits queued items into day/session/slot
   // and stamps each with a WAT timestamp. Idempotent: re-runnable any time.
   function buildSchedule() {
     const p = CONFIG.presets[CONFIG.active];
     const perDay = p.postsPerSession * p.sessions;
-    const queue = store.getQueue().filter((x) => x.state === 'queued');
-    if (!queue.length) { log('Nothing queued to schedule.', 'warn'); return; }
+    const all = store.getQueue().filter((x) => x.state === 'queued');
+    const queue = all.filter(isSchedulable);
+    const parkedPics = all.length - queue.length;
+    if (!queue.length) {
+      log(parkedPics
+        ? `Nothing schedulable — ${parkedPics} picture(s) are parked. Turn Mix Pics ON to include them.`
+        : 'Nothing queued to schedule.', 'warn');
+      return;
+    }
 
     const [sh, sm] = CONFIG.startTime.split(':').map(Number);
     let n = 0;
@@ -687,7 +754,8 @@
       store.upsert(item);
       n++;
     }
-    log(`Schedule built: ${cap} posts across ${Math.ceil(cap / perDay)} day(s), ${CONFIG.active}.`);
+    log(`Schedule built: ${cap} posts across ${Math.ceil(cap / perDay)} day(s), ${CONFIG.active}.`
+      + (parkedPics ? `  (${parkedPics} picture(s) parked — Mix Pics is OFF.)` : ''));
   }
 
   // ---------------------------------------------------- COMPOSER INSERT
@@ -886,7 +954,9 @@
   function statusSummary() {
     const q = store.getQueue();
     const by = (s) => q.filter((x) => x.state === s).length;
-    const pool = q.filter((x) => x.state === 'queued' && !x.scheduledAt).length;
+    const unbuilt = q.filter((x) => x.state === 'queued' && !x.scheduledAt);
+    const vidPool = unbuilt.filter((x) => x.media !== 'photo').length;   // videos + captions
+    const picPool = unbuilt.filter((x) => x.media === 'photo').length;   // parked pictures
     const built = q.filter((x) => x.state === 'queued' && x.scheduledAt).length;
     const postedIds = store.getPosted().size;
     const today = new Date().toDateString();
@@ -900,10 +970,10 @@
     const p = CONFIG.presets[CONFIG.active];
     const perDay = p.postsPerSession * p.sessions;
     return [
-      `pool(unbuilt):${pool}  ready(built):${built}  handed-to-X:${by('scheduled')}`,
+      `videos+caps:${vidPool}  pictures(parked):${picPool}  ready(built):${built}  handed-to-X:${by('scheduled')}`,
       `dead:${by('dead')}  rejected:${by('rejected')}  posted-ids tracked:${postedIds}`,
       `scheduled today:${schedToday}  next:${nextStr}`,
-      `preset:${CONFIG.active} (${p.postsPerSession}×${p.sessions}=${perDay}/day)  start:${CONFIG.startTime}  daysAhead:${CONFIG.daysAhead}  cap:${CONFIG.dailyCap}/day  dryRun:${CONFIG.dryRun}`,
+      `preset:${CONFIG.active} (${p.postsPerSession}×${p.sessions}=${perDay}/day)  start:${CONFIG.startTime}  daysAhead:${CONFIG.daysAhead}  cap:${CONFIG.dailyCap}/day  mixPics:${CONFIG.mixPictures}  dryRun:${CONFIG.dryRun}`,
     ].join('\n');
   }
 
@@ -1168,6 +1238,7 @@
           <input id="xbs-liken" type="number" min="1" inputmode="numeric" placeholder="50"
             title="How many posts in view to like (default 50). Run this on a SEARCH page you've filtered. Obeys dryRun — flip dryRun off to actually like."
             style="width:46px;background:#0b1015;color:#fff;border:1px solid #38444d;border-radius:6px;padding:2px 4px;text-align:center"/>
+          <button data-a="search" style="flex:1;background:#158">Search</button>
         </div>
         <div style="display:flex;gap:4px;margin-bottom:6px">
           <button data-a="status" style="flex:1">Status</button>
@@ -1188,6 +1259,10 @@
           <button data-a="photos"  style="flex:1" id="xbs-photos">Photos: off</button>
         </div>
         <div style="display:flex;gap:4px;margin-bottom:6px">
+          <button data-a="mixpics" style="flex:1" id="xbs-mixpics">Mix Pics: off</button>
+          <button data-a="reset"   style="flex:1;background:#a01">Reset (re-harvest)</button>
+        </div>
+        <div style="display:flex;gap:4px;margin-bottom:6px">
           <button data-a="probe" style="flex:1;background:#1a6">Probe (run tests)</button>
         </div>
         <pre id="xbs-log" style="height:120px;overflow:auto;background:#0b1015;margin:0;padding:4px;border-radius:6px;white-space:pre-wrap"></pre>
@@ -1205,6 +1280,8 @@
       status: () => log(statusSummary()),
       timing: editTiming,
       clear: clearQueued,
+      reset: resetHarvest,
+      search: openSearch,
       export: exportQueue,
       import: importQueue,
       captions: () => {
@@ -1227,9 +1304,19 @@
       inspect: inspectView,
       photos: () => {
         CONFIG.harvestPhotos = !CONFIG.harvestPhotos;
+        saveSettings();
         const b = document.getElementById('xbs-photos');
         if (b) b.textContent = `Photos: ${CONFIG.harvestPhotos ? 'on' : 'off'}`;
-        log(`Photo harvesting ${CONFIG.harvestPhotos ? 'ON' : 'OFF'}.`);
+        log(`Photo harvesting ${CONFIG.harvestPhotos ? 'ON — Harvest will now collect picture posts too (kept as a parked pool).' : 'OFF — Harvest collects videos only.'}`);
+      },
+      mixpics: () => {
+        CONFIG.mixPictures = !CONFIG.mixPictures;
+        saveSettings();
+        const b = document.getElementById('xbs-mixpics');
+        if (b) b.textContent = `Mix Pics: ${CONFIG.mixPictures ? 'on' : 'off'}`;
+        log(CONFIG.mixPictures
+          ? 'Mix Pics ON — parked pictures will be scheduled alongside videos. Tap Shuffle/Build to fold them in.'
+          : 'Mix Pics OFF — pictures stay parked (saved) and are NOT scheduled until you turn this on.');
       },
       probe,
     };
@@ -1239,6 +1326,11 @@
       const body = wrap.querySelector('#xbs-body');
       body.style.display = body.style.display === 'none' ? 'block' : 'none';
     });
+    // Reflect persisted toggle states on the buttons.
+    const pb = document.getElementById('xbs-photos');
+    if (pb) pb.textContent = `Photos: ${CONFIG.harvestPhotos ? 'on' : 'off'}`;
+    const mb = document.getElementById('xbs-mixpics');
+    if (mb) mb.textContent = `Mix Pics: ${CONFIG.mixPictures ? 'on' : 'off'}`;
     log(`ready — ${statusSummary()}`);
   }
 
