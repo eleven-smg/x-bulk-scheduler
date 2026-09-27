@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X Bulk Scheduler
 // @namespace    x-bulk-scheduler
-// @version      0.8.0
+// @version      0.9.0
 // @description  Harvest video links from bookmarks/likes/official promo posts, prune dead links, and hand them to X's native scheduler. Mobile-friendly (Firefox Android + Tampermonkey).
 // @updateURL    https://raw.githubusercontent.com/eleven-smg/x-bulk-scheduler/main/src/x-bulk-scheduler.user.js
 // @downloadURL  https://raw.githubusercontent.com/eleven-smg/x-bulk-scheduler/main/src/x-bulk-scheduler.user.js
@@ -42,6 +42,12 @@
     },
     active: '12x4',        // default preset; switch to '10x5' any time
     startTime: '00:00',     // first session each day, WAT (Nigeria, UTC+1)
+    gapMinutes: 0,          // SPACE BETWEEN POSTS, in minutes. 0 (default) = keep
+                            //   the preset's session bursts (tight gapSeconds within
+                            //   a session, sessionHours between sessions). Set > 0
+                            //   (e.g. 30, 60) for a STEADY DRIP: every post that many
+                            //   minutes apart from startTime, sessions ignored for
+                            //   timing. Editable from "Timing"; persists.
     daysAhead: 1,           // how many days to schedule per run (queue-cap safety)
     appendVideoSuffix: true,// append /video/1 (or /photo/1) to harvested links
     harvestPhotos: false,   // COLLECT photo posts during Harvest (suffix /photo/1).
@@ -138,7 +144,7 @@
   // panel are persisted here and re-applied at startup. Only these whitelisted
   // fields are user-editable from the panel (never dryRun — going live stays a
   // deliberate code change so nothing posts by accident).
-  const SETTABLE = ['active', 'startTime', 'daysAhead', 'dailyCap', 'harvestPhotos', 'mixPictures'];
+  const SETTABLE = ['active', 'startTime', 'gapMinutes', 'daysAhead', 'dailyCap', 'harvestPhotos', 'mixPictures'];
   function loadSettings() {
     let s = {};
     try { s = JSON.parse(GM_getValue(KEYS.settings, '{}')) || {}; } catch (e) { s = {}; }
@@ -776,6 +782,7 @@
     }
 
     const [sh, sm] = CONFIG.startTime.split(':').map(Number);
+    const evenGapMin = Math.max(0, Math.floor(Number(CONFIG.gapMinutes) || 0));
     let n = 0;
     const cap = Math.min(queue.length, CONFIG.daysAhead * perDay, CONFIG.dailyCap * CONFIG.daysAhead);
     for (let i = 0; i < cap; i++) {
@@ -788,16 +795,24 @@
       const d = new Date();
       d.setDate(d.getDate() + day);
       d.setHours(sh, sm, 0, 0);
-      // session offset + per-slot gap (jittered spacing handled at run time)
-      d.setHours(d.getHours() + session * p.sessionHours);
-      d.setSeconds(d.getSeconds() + slot * p.gapSeconds);
+      if (evenGapMin > 0) {
+        // Steady drip: every post evenGapMin minutes apart from startTime.
+        // Sessions/slots still recorded for reference but don't shape the time.
+        d.setMinutes(d.getMinutes() + within * evenGapMin);
+      } else {
+        // Preset session bursts: sessionHours between sessions, gapSeconds within.
+        // (jittered spacing handled at run time)
+        d.setHours(d.getHours() + session * p.sessionHours);
+        d.setSeconds(d.getSeconds() + slot * p.gapSeconds);
+      }
 
       item.day = day; item.session = session; item.slot = slot;
       item.scheduledAt = d.toISOString();
       store.upsert(item);
       n++;
     }
-    log(`Schedule built: ${cap} posts across ${Math.ceil(cap / perDay)} day(s), ${CONFIG.active}.`
+    const spacing = evenGapMin > 0 ? `${evenGapMin} min apart (drip)` : `${CONFIG.active} bursts`;
+    log(`Schedule built: ${cap} posts across ${Math.ceil(cap / perDay)} day(s), ${spacing}.`
       + (parkedPics ? `  (${parkedPics} picture(s) parked — Mix Pics is OFF.)` : ''));
   }
 
@@ -1016,7 +1031,7 @@
       `videos+caps:${vidPool}  pictures(parked):${picPool}  ready(built):${built}  handed-to-X:${by('scheduled')}`,
       `dead:${by('dead')}  rejected:${by('rejected')}  posted-ids tracked:${postedIds}`,
       `scheduled today:${schedToday}  next:${nextStr}`,
-      `preset:${CONFIG.active} (${p.postsPerSession}×${p.sessions}=${perDay}/day)  start:${CONFIG.startTime}  daysAhead:${CONFIG.daysAhead}  cap:${CONFIG.dailyCap}/day  mixPics:${CONFIG.mixPictures}  dryRun:${CONFIG.dryRun}`,
+      `preset:${CONFIG.active} (${p.postsPerSession}×${p.sessions}=${perDay}/day)  start:${CONFIG.startTime}  gap:${CONFIG.gapMinutes > 0 ? CONFIG.gapMinutes + 'min drip' : 'bursts'}  daysAhead:${CONFIG.daysAhead}  cap:${CONFIG.dailyCap}/day  mixPics:${CONFIG.mixPictures}  dryRun:${CONFIG.dryRun}`,
     ].join('\n');
   }
 
@@ -1038,7 +1053,7 @@
       posted: GM_getValue(KEYS.posted, '[]'),
       settings: GM_getValue(KEYS.settings, '{}'),
       active: CONFIG.active, mix: CONFIG.mixPictures, days: CONFIG.daysAhead,
-      cap: CONFIG.dailyCap, start: CONFIG.startTime,
+      cap: CONFIG.dailyCap, start: CONFIG.startTime, gap: CONFIG.gapMinutes,
     };
     try {
       // -- id / url helpers --
@@ -1090,6 +1105,18 @@
       ok('build all day 0', q2.filter((x) => x.scheduledAt && x.day === 0).length === built.length);
       ok('build session boundary', built[12] && built[12].session === 1 && built[12].slot === 0);
       ok('build last slot', built[47] && built[47].session === 3 && built[47].slot === 11);
+      // -- per-post even spacing (gapMinutes drip) --
+      CONFIG.gapMinutes = 30; CONFIG.startTime = '09:00';
+      store.setQueue(big.map((x) => ({ ...x, state: 'queued', scheduledAt: null })));
+      buildSchedule();
+      const drip = store.getQueue().filter((x) => x.scheduledAt)
+        .sort((a, b) => new Date(a.scheduledAt) - new Date(b.scheduledAt));
+      const t0 = new Date(drip[0].scheduledAt);
+      const t1 = new Date(drip[1].scheduledAt);
+      const t2 = new Date(drip[2].scheduledAt);
+      ok('drip start honours startTime', t0.getHours() === 9 && t0.getMinutes() === 0);
+      ok('drip gap = gapMinutes', (t1 - t0) === 30 * 60000 && (t2 - t1) === 30 * 60000);
+      CONFIG.gapMinutes = 0; CONFIG.startTime = '00:00';
       // -- picture parking through Build (small pool) --
       const small = [mk(1, 'video'), mk(2, 'video'), mk(3, 'video'), mk(4, 'video'),
         mk(900, 'photo'), mk(901, 'photo')];
@@ -1136,6 +1163,7 @@
       GM_setValue(KEYS.settings, snap.settings);
       CONFIG.active = snap.active; CONFIG.mixPictures = snap.mix;
       CONFIG.daysAhead = snap.days; CONFIG.dailyCap = snap.cap; CONFIG.startTime = snap.start;
+      CONFIG.gapMinutes = snap.gap;
     }
     const passed = results.filter((r) => r.pass).length;
     const failed = results.filter((r) => !r.pass);
@@ -1156,6 +1184,13 @@
     if (st && /^\d{1,2}:\d{2}$/.test(st.trim())) CONFIG.startTime = st.trim();
     else if (st && st.trim()) log(`"${st.trim()}" isn't HH:MM — kept ${CONFIG.startTime}.`, 'warn');
 
+    const gm = prompt(`Space between posts, in MINUTES.\n0 = preset bursts (tight, then long gaps).\nAny number = steady drip that many minutes apart (e.g. 30, 60).\nBlank = keep (${CONFIG.gapMinutes}).`);
+    if (gm !== null && gm.trim() !== '') {
+      const v = Number(gm.trim());
+      if (v >= 0 && Number.isFinite(v)) CONFIG.gapMinutes = Math.floor(v);
+      else log(`"${gm.trim()}" isn't a number — kept gap ${CONFIG.gapMinutes} min.`, 'warn');
+    }
+
     const da = prompt(`How many days ahead to schedule per run.\nBlank = keep (${CONFIG.daysAhead}).`);
     if (da && Number(da) > 0) CONFIG.daysAhead = Math.floor(Number(da));
 
@@ -1164,7 +1199,8 @@
 
     saveSettings();
     const p = CONFIG.presets[CONFIG.active];
-    log(`Timing saved: ${CONFIG.active} (${p.postsPerSession * p.sessions}/day), start ${CONFIG.startTime}, ${CONFIG.daysAhead} day(s) ahead, cap ${CONFIG.dailyCap}. Tap Build to apply.`);
+    const gapTxt = CONFIG.gapMinutes > 0 ? `${CONFIG.gapMinutes} min apart` : `${CONFIG.active} bursts`;
+    log(`Timing saved: ${CONFIG.active} (${p.postsPerSession * p.sessions}/day), start ${CONFIG.startTime}, ${gapTxt}, ${CONFIG.daysAhead} day(s) ahead, cap ${CONFIG.dailyCap}. Tap Build to apply.`);
   }
 
   // -------------------------------------------------------- CAPTION ENGINE
