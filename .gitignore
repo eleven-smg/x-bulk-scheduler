@@ -7,3 +7,5 @@ TESTING.md
 DESKTOP-TESTING.md
 xbs-*.json
 *.log
+# Never publish the MCP config — it points at a token env var, keep it local.
+.mcp.json

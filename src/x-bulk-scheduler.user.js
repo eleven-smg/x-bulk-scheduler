@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X Bulk Scheduler
 // @namespace    x-bulk-scheduler
-// @version      0.4.6
+// @version      0.5.0
 // @description  Harvest video links from bookmarks/likes/official promo posts, prune dead links, and hand them to X's native scheduler. Mobile-friendly (Firefox Android + Tampermonkey).
 // @updateURL    https://raw.githubusercontent.com/eleven-smg/x-bulk-scheduler/main/src/x-bulk-scheduler.user.js
 // @downloadURL  https://raw.githubusercontent.com/eleven-smg/x-bulk-scheduler/main/src/x-bulk-scheduler.user.js
@@ -49,6 +49,10 @@
                             // video-only pages behave exactly as before.
     dryRun: true,           // TRUE = log actions only, never click final Confirm
     dailyCap: 48,           // stop scheduling past this many/day (free-tier ~50)
+    unbookmarkAfterPost: true, // once a BOOKMARKED item is scheduled, remove it
+                            // from bookmarks (trickled) so the backlog frontier
+                            // stays at the top. Only acts on source==='bookmarks';
+                            // PREVIEWS in log until BOOKMARK_REMOVE_MAPPED is set.
     useOembedCheck: false,  // Layer-2 dead-link ping. OFF: publish.x.com/oembed
                             // now returns 402 (paywalled) — see BUGS.md 2026-09-23.
                             // Tombstone detection (Layer 1) is the free primary.
@@ -96,10 +100,15 @@
   // one confirmed live test. Setting this true just means the DOM path exists.
   const SCHEDULER_MAPPED = true;
 
+  // The bookmark-remove control isn't DOM-mapped yet (needs an on-device Inspect
+  // of the "•••" menu). Until it is, unbookmark-after-post only PREVIEWS in the
+  // log (never touches live bookmarks even with dryRun off). See runSchedule.
+  const BOOKMARK_REMOVE_MAPPED = false;
+
   // --------------------------------------------------------------- STORAGE
   const KEYS = { queue: 'xbs_queue', posted: 'xbs_posted_ids', log: 'xbs_log',
     captions: 'xbs_captions', delcand: 'xbs_delete_candidates',
-    lasthv: 'xbs_last_harvest' };
+    lasthv: 'xbs_last_harvest', settings: 'xbs_settings' };
 
   const store = {
     getQueue() { return JSON.parse(GM_getValue(KEYS.queue, '[]')); },
@@ -117,6 +126,24 @@
       this.setQueue(q);
     },
   };
+
+  // ------------------------------------------------------- SAVED SETTINGS
+  // CONFIG is re-created on every page load, so timing tweaks made from the
+  // panel are persisted here and re-applied at startup. Only these whitelisted
+  // fields are user-editable from the panel (never dryRun — going live stays a
+  // deliberate code change so nothing posts by accident).
+  const SETTABLE = ['active', 'startTime', 'daysAhead', 'dailyCap'];
+  function loadSettings() {
+    let s = {};
+    try { s = JSON.parse(GM_getValue(KEYS.settings, '{}')) || {}; } catch (e) { s = {}; }
+    for (const k of SETTABLE) if (s[k] !== undefined) CONFIG[k] = s[k];
+  }
+  function saveSettings() {
+    const s = {};
+    for (const k of SETTABLE) s[k] = CONFIG[k];
+    GM_setValue(KEYS.settings, JSON.stringify(s));
+  }
+  loadSettings();
 
   // ------------------------------------------------------------------- LOG
   const logBuf = JSON.parse(GM_getValue(KEYS.log, '[]'));
@@ -585,9 +612,12 @@
   async function likeVisible(targetN) {
     if (LIKING) { log('Already liking.', 'warn'); return; }
     const want = Math.min(Number(targetN) > 0 ? Number(targetN) : CONFIG.like.cap, CONFIG.like.maxPerRun);
-    if (!/\/search/.test(location.pathname)) {
-      log('Tip: run Like on a SEARCH results page you have filtered. Continuing on this page anyway.', 'warn');
-    }
+    // Works anywhere posts render — search results, a profile, or the feed. A
+    // profile or a filtered search is the sane use (you know whose content it is).
+    const path = location.pathname;
+    const knownPage = /\/search|\/home/.test(path) ||
+      /^\/[^/]+(\/(with_replies|media|likes|highlights)?)?$/.test(path);
+    if (!knownPage) log('Tip: Like is meant for a filtered search or a profile. Liking whatever is in view here.', 'warn');
     if (!CONFIG.dryRun && !likeVisible._ok) {
       const ok = window.confirm(
         `LIKE BOT — live mode\n\nAbout to LIKE up to ${want} posts in view, ~1.9–4.5s apart.\n\n` +
@@ -821,11 +851,28 @@
           const alive = await oembedCheck(item.id, author);
           if (!alive) { item.state = 'dead'; store.upsert(item); log(`dead, skipped ${item.id}`, 'warn'); continue; }
         }
-        await schedulePost(item);
+        const ok = await schedulePost(item);
+        if (ok && CONFIG.unbookmarkAfterPost && item.source === 'bookmarks') {
+          await unbookmarkAfterPost(item);
+        }
         await sleep(jitter(1500, 1500)); // trickle writes, human-ish
       }
       log('Run complete.');
     } finally { RUNNING = false; }
+  }
+
+  // Trickled unbookmark once a bookmarked item is safely scheduled — the
+  // permanent backlog fix (keeps the top of Bookmarks as the un-done frontier).
+  // Honest state: the remove control isn't DOM-mapped yet, so this only logs the
+  // intent. When BOOKMARK_REMOVE_MAPPED flips true (after an on-device Inspect of
+  // the ••• menu → "Remove from Bookmarks"), wire the real click here.
+  async function unbookmarkAfterPost(item) {
+    if (CONFIG.dryRun || !BOOKMARK_REMOVE_MAPPED) {
+      log(`${CONFIG.dryRun ? '[dryRun] ' : ''}would unbookmark ${item.id} (remove control not mapped yet)`);
+      return;
+    }
+    // TODO(on-device): open the post's ••• menu, click "Remove from Bookmarks".
+    log(`unbookmark ${item.id}: mapping pending`, 'warn');
   }
 
   function panic() {
@@ -835,10 +882,52 @@
     log('PANIC: run halted. In-flight items left as-is.', 'warn');
   }
 
+  // Multi-line stats readout (Status button). Pure read, always safe.
   function statusSummary() {
     const q = store.getQueue();
     const by = (s) => q.filter((x) => x.state === s).length;
-    return `queued:${by('queued')} scheduled:${by('scheduled')} posted:${by('posted')} dead:${by('dead')} rejected:${by('rejected')} | preset:${CONFIG.active} dryRun:${CONFIG.dryRun}`;
+    const pool = q.filter((x) => x.state === 'queued' && !x.scheduledAt).length;
+    const built = q.filter((x) => x.state === 'queued' && x.scheduledAt).length;
+    const postedIds = store.getPosted().size;
+    const today = new Date().toDateString();
+    const schedToday = q.filter((x) => x.scheduledAt &&
+      new Date(x.scheduledAt).toDateString() === today).length;
+    const nextAt = q.filter((x) => x.state === 'queued' && x.scheduledAt)
+      .map((x) => x.scheduledAt).sort()[0];
+    const nextStr = nextAt
+      ? new Date(nextAt).toLocaleString('en-GB', { timeZone: CONFIG.timezone })
+      : '—';
+    const p = CONFIG.presets[CONFIG.active];
+    const perDay = p.postsPerSession * p.sessions;
+    return [
+      `pool(unbuilt):${pool}  ready(built):${built}  handed-to-X:${by('scheduled')}`,
+      `dead:${by('dead')}  rejected:${by('rejected')}  posted-ids tracked:${postedIds}`,
+      `scheduled today:${schedToday}  next:${nextStr}`,
+      `preset:${CONFIG.active} (${p.postsPerSession}×${p.sessions}=${perDay}/day)  start:${CONFIG.startTime}  daysAhead:${CONFIG.daysAhead}  cap:${CONFIG.dailyCap}/day  dryRun:${CONFIG.dryRun}`,
+    ].join('\n');
+  }
+
+  // "Timing" button — edit the schedule shape without touching code (owner is
+  // non-technical). prompt()-based so it works on mobile; persists via saveSettings.
+  function editTiming() {
+    const presetKeys = Object.keys(CONFIG.presets);
+    const pr = prompt(`Preset — how many posts per day.\nOptions: ${presetKeys.join(' , ')}\nBlank = keep (${CONFIG.active}).`);
+    if (pr && CONFIG.presets[pr.trim()]) CONFIG.active = pr.trim();
+    else if (pr && pr.trim()) { log(`Unknown preset "${pr.trim()}" — kept ${CONFIG.active}.`, 'warn'); }
+
+    const st = prompt(`Daily start time, 24h HH:MM (WAT).\nBlank = keep (${CONFIG.startTime}).`);
+    if (st && /^\d{1,2}:\d{2}$/.test(st.trim())) CONFIG.startTime = st.trim();
+    else if (st && st.trim()) log(`"${st.trim()}" isn't HH:MM — kept ${CONFIG.startTime}.`, 'warn');
+
+    const da = prompt(`How many days ahead to schedule per run.\nBlank = keep (${CONFIG.daysAhead}).`);
+    if (da && Number(da) > 0) CONFIG.daysAhead = Math.floor(Number(da));
+
+    const cap = prompt(`Daily cap (safety ceiling; X free-tier ≈ 50).\nBlank = keep (${CONFIG.dailyCap}).`);
+    if (cap && Number(cap) > 0) CONFIG.dailyCap = Math.floor(Number(cap));
+
+    saveSettings();
+    const p = CONFIG.presets[CONFIG.active];
+    log(`Timing saved: ${CONFIG.active} (${p.postsPerSession * p.sessions}/day), start ${CONFIG.startTime}, ${CONFIG.daysAhead} day(s) ahead, cap ${CONFIG.dailyCap}. Tap Build to apply.`);
   }
 
   // -------------------------------------------------------- CAPTION ENGINE
@@ -1082,6 +1171,7 @@
         </div>
         <div style="display:flex;gap:4px;margin-bottom:6px">
           <button data-a="status" style="flex:1">Status</button>
+          <button data-a="timing" style="flex:1">Timing</button>
           <button data-a="clear"  style="flex:1">Clear-Q</button>
           <button data-a="stop"   style="flex:1;background:#a01">Stop</button>
         </div>
@@ -1113,6 +1203,7 @@
       like: () => { const el = document.getElementById('xbs-liken');
         likeVisible(el && el.value ? Number(el.value) : 0); },
       status: () => log(statusSummary()),
+      timing: editTiming,
       clear: clearQueued,
       export: exportQueue,
       import: importQueue,
