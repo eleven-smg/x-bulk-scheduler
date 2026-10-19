@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X Bulk Scheduler
 // @namespace    x-bulk-scheduler
-// @version      0.11.1
+// @version      0.12.0
 // @description  Harvest video links from bookmarks/likes/official promo posts, prune dead links, and hand them to X's native scheduler. Mobile-friendly (Firefox Android + Tampermonkey).
 // @updateURL    https://raw.githubusercontent.com/eleven-smg/x-bulk-scheduler/main/src/x-bulk-scheduler.user.js
 // @downloadURL  https://raw.githubusercontent.com/eleven-smg/x-bulk-scheduler/main/src/x-bulk-scheduler.user.js
@@ -85,6 +85,10 @@
     // This lets likes run for real while posting stays safely in preview.
     // Still: confirm-once per page load, capped, paced. Toggle from the panel.
     likeDryRun: true,
+    // Community posting runs NOW (X's native scheduler cannot schedule community
+    // posts). Same shape as likes: its own persisted switch, confirm-once per
+    // page load, one post per tap. Default dry = logs the plan step only.
+    communityDryRun: true,
     // Search-harvest defaults (Phase: search). X search operators.
     search: {
       minFaves: 1000,       // only videos with >= this many likes
@@ -217,7 +221,7 @@
   // panel are persisted here and re-applied at startup. Only these whitelisted
   // fields are user-editable from the panel (never dryRun — going live stays a
   // deliberate code change so nothing posts by accident).
-  const SETTABLE = ['active', 'startTime', 'gapMinutes', 'daysAhead', 'dailyCap', 'harvestPhotos', 'mixPictures', 'likeDryRun'];
+  const SETTABLE = ['active', 'startTime', 'gapMinutes', 'daysAhead', 'dailyCap', 'harvestPhotos', 'mixPictures', 'likeDryRun', 'communityDryRun'];
   function loadSettings() {
     let s = {};
     try { s = JSON.parse(GM_getValue(KEYS.settings, '{}')) || {}; } catch (e) { s = {}; }
@@ -1164,7 +1168,8 @@
       `videos+caps:${vidPool}  pictures(parked):${picPool}  ready(built):${built}  handed-to-X:${by('scheduled')}`,
       `dead:${by('dead')}  rejected:${by('rejected')}  posted-ids tracked:${postedIds}`,
       `scheduled today:${schedToday}  next:${nextStr}`,
-      `preset:${CONFIG.active} (${p.postsPerSession}×${p.sessions}=${perDay}/day)  start:${CONFIG.startTime}  gap:${CONFIG.gapMinutes > 0 ? CONFIG.gapMinutes + 'min drip' : 'bursts'}  daysAhead:${CONFIG.daysAhead}  cap:${CONFIG.dailyCap}/day  mixPics:${CONFIG.mixPictures}  postDryRun:${CONFIG.dryRun}  likes:${CONFIG.likeDryRun ? 'dry' : 'LIVE'}`,
+      `preset:${CONFIG.active} (${p.postsPerSession}×${p.sessions}=${perDay}/day)  start:${CONFIG.startTime}  gap:${CONFIG.gapMinutes > 0 ? CONFIG.gapMinutes + 'min drip' : 'bursts'}  daysAhead:${CONFIG.daysAhead}  cap:${CONFIG.dailyCap}/day  mixPics:${CONFIG.mixPictures}  postDryRun:${CONFIG.dryRun}  likes:${CONFIG.likeDryRun ? 'dry' : 'LIVE'}  comm:${CONFIG.communityDryRun ? 'dry' : 'LIVE'}`,
+      `account:@${ACCOUNT || '?'}  general:${getGeneral().length}`,
     ].join('\n');
   }
 
@@ -1613,6 +1618,85 @@
     return plan;
   }
 
+  // Prefer the plan's own URL when present; fall back to the community compose
+  // route X uses for posting inside a community.
+  function composerBoxEl() {
+    return document.querySelector(CONFIG.selectors.composerBox) ||
+      document.querySelector('[contenteditable="true"][role="textbox"]');
+  }
+  function submitBtnEl() {
+    return document.querySelector('[data-testid="tweetButtonInline"]') ||
+      document.querySelector(CONFIG.selectors.tweetButton);
+  }
+
+  // Post ONE planned link into ONE community. Community posts cannot be
+  // scheduled, so this is a now-action, one tap = one post, with its own
+  // dry/live switch and a confirm before the first live post of a page load.
+  async function postCommunityStep(step) {
+    const text = step.link;
+    const preview = !!CONFIG.communityDryRun;
+    log(`${preview ? '[dryRun] ' : ''}community ${step.community}: ${step.id}`);
+
+    // Step 1 — make sure we're inside the community.
+    if (!location.href.startsWith(step.url.split('?')[0])) {
+      log(`Opening ${step.community}… when it loads, tap "Post Community" again.`);
+      location.assign(step.url);
+      return false;
+    }
+
+    if (preview) {
+      log(`[dryRun] would post ${step.id} into ${step.community}. Toggle "Comm: live" to actually post.`);
+      return false;
+    }
+    if (!postCommunityStep._ok) {
+      const ok = window.confirm(
+        `COMMUNITY POST — live\n\nOne real post (${step.id}) into "${step.community}".\n\n` +
+        `Community posts cannot be scheduled or undone in bulk. Proceed?`);
+      if (!ok) { log('Community post cancelled.', 'warn'); return false; }
+      postCommunityStep._ok = true;
+    }
+
+    const box = composerBoxEl();
+    if (!box) {
+      log('Community composer not found on this page. Post by hand once, then send me an Inspect so I can map it.', 'warn');
+      return false;
+    }
+    if (!insertIntoComposer(box, text)) { log('Community insert failed.', 'warn'); return false; }
+    await sleep(jitter(900, 400));
+    const submit = submitBtnEl();
+    if (!submit) { log('Community Post button not found.', 'warn'); return false; }
+    if (submit.getAttribute('aria-disabled') === 'true') { log('Community Post button disabled — is the text actually in the box?', 'warn'); return false; }
+    submit.click();
+    await sleep(jitter(2500, 1200));
+    if (composerBoxEl()) { log('Composer still open after submit — post not confirmed. Check by hand.', 'warn'); return false; }
+
+    // Record it on the queue item so the planner never repeats it there.
+    const q = store.getQueue();
+    const it = q.find((x) => x.id === step.id);
+    if (it) {
+      it.communities = it.communities || [];
+      if (!it.communities.includes(step.community)) it.communities.push(step.community);
+      store.upsert(it);
+    }
+    let done = {};
+    try { done = JSON.parse(GM_getValue(COMMUNITY_DONE_KEY, '{}')) || {}; } catch (e) { done = {}; }
+    (done[step.community] = done[step.community] || []).push(step.id);
+    GM_setValue(COMMUNITY_DONE_KEY, JSON.stringify(done));
+    log(`Posted ${step.id} into ${step.community}.`);
+    return true;
+  }
+
+  async function nextCommunityPost() {
+    let plan = [];
+    try { plan = (JSON.parse(GM_getValue(COMMUNITY_PLAN_KEY, '{}')) || {}).plan || []; } catch (e) { plan = []; }
+    if (!plan.length) { log('No community plan yet — tap Communities → plan first.', 'warn'); return; }
+    let done = {};
+    try { done = JSON.parse(GM_getValue(COMMUNITY_DONE_KEY, '{}')) || {}; } catch (e) { done = {}; }
+    const step = plan.find((p) => !(done[p.community] || []).includes(p.id));
+    if (!step) { log('Community plan finished — every planned link was posted. Make a new plan for more.', 'warn'); return; }
+    await postCommunityStep(step);
+  }
+
   function editCollections() {
     const cols = getCollections();
     const names = cols.map((c) => `${c.name}(${(c.communities || []).length})`).join(', ') || '(none yet)';
@@ -1661,9 +1745,7 @@
       log(`Community plan for "${col.name}": ${plan.length} post(s) across ${col.communities.length} community(ies).`);
       if (!plan.length) log('  ↳ no fresh links left for these communities — harvest more first.', 'warn');
       plan.slice(0, 12).forEach((p) => log(`  ${p.community} ← ${p.id}`));
-      log(COMMUNITY_MAPPED
-        ? 'Run it from the panel.'
-        : 'Saved as a plan only — community posting click-through is not mapped yet (needs one Inspect of a community page). Nothing posted.');
+      log('Saved. Tap "Post Community" to work through it one post at a time (community posts can\'t be scheduled).');
     } else if (op === 'del') {
       const cname = prompt(`Delete which collection?\n${cols.map((c) => c.name).join(' / ')}`);
       const i = cols.findIndex((c) => c.name.toLowerCase() === String(cname || '').trim().toLowerCase());
@@ -1851,7 +1933,13 @@
           <button data-a="genfrom" style="flex:1;background:#275"
             title="Pull links from the General queue into THIS account's pool.">From General</button>
           <button data-a="communities" style="flex:1;background:#654"
-            title="Collections of communities + a per-session posting plan (plan only until community compose is mapped).">Communities</button>
+            title="Collections of communities + a per-session posting plan.">Communities</button>
+        </div>
+        <div style="display:flex;gap:4px;margin-bottom:6px">
+          <button data-a="commnext" style="flex:2;background:#963"
+            title="Post the next planned link into its community (NOW — community posts cannot be scheduled). One tap = one post.">Post Community</button>
+          <button data-a="commmode" style="flex:1;background:#555" id="xbs-commmode"
+            title="DRY = show the next planned step only. LIVE = actually post (asks once per page load).">Comm: dry</button>
         </div>
         <div style="display:flex;gap:4px;margin-bottom:6px">
           <button data-a="selftest" style="flex:1;background:#26a">Self-Test (logic)</button>
@@ -1928,6 +2016,19 @@
       gento: addToGeneral,
       genfrom: pullFromGeneral,
       communities: editCollections,
+      commnext: nextCommunityPost,
+      commmode: () => {
+        CONFIG.communityDryRun = !CONFIG.communityDryRun;
+        saveSettings();
+        const b = document.getElementById('xbs-commmode');
+        if (b) {
+          b.textContent = `Comm: ${CONFIG.communityDryRun ? 'dry' : 'live'}`;
+          b.style.background = CONFIG.communityDryRun ? '#555' : '#963';
+        }
+        log(CONFIG.communityDryRun
+          ? 'Community posting: DRY — shows the next planned step only.'
+          : 'Community posting: LIVE — one tap posts one planned link into one community (asks once per page load). Community posts cannot be scheduled.');
+      },
       probe,
     };
     wrap.querySelectorAll('button[data-a]').forEach((b) =>
@@ -1945,6 +2046,11 @@
     if (lb) {
       lb.textContent = `Likes: ${CONFIG.likeDryRun ? 'dry' : 'live'}`;
       lb.style.background = CONFIG.likeDryRun ? '#555' : '#b25';
+    }
+    const cb = document.getElementById('xbs-commmode');
+    if (cb) {
+      cb.textContent = `Comm: ${CONFIG.communityDryRun ? 'dry' : 'live'}`;
+      cb.style.background = CONFIG.communityDryRun ? '#555' : '#963';
     }
     log(`ready — ${statusSummary()}`);
   }
