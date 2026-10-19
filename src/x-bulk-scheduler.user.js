@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X Bulk Scheduler
 // @namespace    x-bulk-scheduler
-// @version      0.9.0
+// @version      0.10.0
 // @description  Harvest video links from bookmarks/likes/official promo posts, prune dead links, and hand them to X's native scheduler. Mobile-friendly (Firefox Android + Tampermonkey).
 // @updateURL    https://raw.githubusercontent.com/eleven-smg/x-bulk-scheduler/main/src/x-bulk-scheduler.user.js
 // @downloadURL  https://raw.githubusercontent.com/eleven-smg/x-bulk-scheduler/main/src/x-bulk-scheduler.user.js
@@ -77,9 +77,14 @@
     like: {
       cap: 50,            // default target per run (the number box overrides)
       maxPerRun: 80,      // hard ceiling — a run never likes more than this
-      minGapMs: 1900,     // human-ish spacing between likes …
-      gapSpread: 2600,    // … + up to this much random extra (≈1.9–4.5s each)
+      minGapMs: 1800,     // human-ish spacing between likes …
+      gapSpread: 1600,    // … + up to this much random extra (≈1.8–3.4s each)
     },
+    // SEPARATE switch for likes. The global dryRun above also gates POSTING, so
+    // tying likes to it meant you couldn't like for real until posting was live.
+    // This lets likes run for real while posting stays safely in preview.
+    // Still: confirm-once per page load, capped, paced. Toggle from the panel.
+    likeDryRun: true,
     // Search-harvest defaults (Phase: search). X search operators.
     search: {
       minFaves: 1000,       // only videos with >= this many likes
@@ -144,7 +149,7 @@
   // panel are persisted here and re-applied at startup. Only these whitelisted
   // fields are user-editable from the panel (never dryRun — going live stays a
   // deliberate code change so nothing posts by accident).
-  const SETTABLE = ['active', 'startTime', 'gapMinutes', 'daysAhead', 'dailyCap', 'harvestPhotos', 'mixPictures'];
+  const SETTABLE = ['active', 'startTime', 'gapMinutes', 'daysAhead', 'dailyCap', 'harvestPhotos', 'mixPictures', 'likeDryRun'];
   function loadSettings() {
     let s = {};
     try { s = JSON.parse(GM_getValue(KEYS.settings, '{}')) || {}; } catch (e) { s = {}; }
@@ -712,18 +717,48 @@
   // review-then-unlike step is your safety net.
   let LIKING = false;
 
+  // Is this button already in the liked state? X swaps testid like→unlike.
+  const isLikedBtn = (b) => b.getAttribute('data-testid') === 'unlike' ||
+    b.getAttribute('aria-pressed') === 'true';
+
+  // One like, with a fallback event sequence. A bare .click() sometimes lands
+  // on X's React wrapper without toggling the control, and X often REPLACES the
+  // button node after a like — so we verify by re-finding the post by id, not by
+  // trusting the old element reference.
+  async function clickLikeOnce(b, own) {
+    const nowLiked = () => {
+      if (!own) return isLikedBtn(b);
+      const arts = [...document.querySelectorAll(CONFIG.selectors.article)];
+      for (const a of arts) {
+        const o = articleOwnId(a);
+        if (o && o.id === own.id) return !!a.querySelector('[data-testid="unlike"]');
+      }
+      return false;
+    };
+    b.click();
+    await sleep(700);
+    if (nowLiked()) return true;
+    for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+      b.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window, button: 0 }));
+      await sleep(40);
+    }
+    await sleep(700);
+    return nowLiked();
+  }
+
   async function likeVisible(targetN) {
     if (LIKING) { log('Already liking.', 'warn'); return; }
     const want = Math.min(Number(targetN) > 0 ? Number(targetN) : CONFIG.like.cap, CONFIG.like.maxPerRun);
+    const preview = !!CONFIG.likeDryRun;
     // Works anywhere posts render — search results, a profile, or the feed. A
     // profile or a filtered search is the sane use (you know whose content it is).
     const path = location.pathname;
     const knownPage = /\/search|\/home/.test(path) ||
       /^\/[^/]+(\/(with_replies|media|likes|highlights)?)?$/.test(path);
     if (!knownPage) log('Tip: Like is meant for a filtered search or a profile. Liking whatever is in view here.', 'warn');
-    if (!CONFIG.dryRun && !likeVisible._ok) {
+    if (!preview && !likeVisible._ok) {
       const ok = window.confirm(
-        `LIKE BOT — live mode\n\nAbout to LIKE up to ${want} posts in view, ~1.9–4.5s apart.\n\n` +
+        `LIKE BOT — live mode\n\nAbout to LIKE up to ${want} posts in view, ~1.8–3.4s apart.\n\n` +
         `These are REAL likes on other people's posts and count as automation, ` +
         `which can get your account rate-limited or locked. Only proceed on a ` +
         `search you've filtered to your client's content.\n\nProceed?`);
@@ -731,31 +766,61 @@
       likeVisible._ok = true; // confirmed for the rest of this page load
     }
     LIKING = true;
-    log(`${CONFIG.dryRun ? '[dryRun] ' : ''}liking up to ${want} post(s)…`);
-    let liked = 0, stable = 0;
+    log(preview
+      ? `[dryRun] Preview: would like up to ${want} post(s). Toggle "Likes: live" to actually like.`
+      : `liking up to ${want} post(s)…`);
+
+    // Each post is handled ONCE per run, keyed by its status id. Without this,
+    // a preview run (where nothing changes on the page) would re-count the same
+    // visible posts forever instead of moving down the page.
+    const seen = new Set();
+    let done = 0, dryPasses = 0, fails = 0;
     try {
-      while (liked < want && stable < 4 && LIKING) {
-        const btns = [...document.querySelectorAll(`${CONFIG.selectors.article} ${CONFIG.selectors.likeButton}`)];
-        let clicked = 0;
+      while (done < want && LIKING && fails < 3 && dryPasses < 40) {
+        const btns = [...document.querySelectorAll(`${CONFIG.selectors.article} ${CONFIG.selectors.likeButton}, ${CONFIG.selectors.article} [data-testid="unlike"]`)];
+        let fresh = 0;
         for (const b of btns) {
-          if (!LIKING || liked >= want) break;
+          if (!LIKING || done >= want) break;
           const art = b.closest(CONFIG.selectors.article);
-          const own = art ? articleOwnId(art) : null;
+          if (!art) continue;
+          const own = articleOwnId(art);
+          const key = own ? `id:${own.id}` : null;
+          if (key ? seen.has(key) : b.dataset.xbsSeen === '1') continue;
+          if (key) seen.add(key); else b.dataset.xbsSeen = '1';
           const tag = own ? own.id : '?';
-          if (CONFIG.dryRun) {
-            log(`[dryRun] would like ${tag} (${liked + 1}/${want})`);
-          } else {
-            b.click();
-            log(`liked ${tag} (${liked + 1}/${want})`);
+          fresh++;
+
+          if (preview) {
+            if (isLikedBtn(b)) { log(`[dryRun] already liked ${tag} — skipped`); continue; }
+            log(`[dryRun] would like ${tag} (${done + 1}/${want})`);
+            done++;
+            continue;
           }
-          liked++; clicked++;
+          if (isLikedBtn(b)) { log(`already liked ${tag} — skipped`); continue; }
+          const ok = await clickLikeOnce(b, own);
+          if (ok) {
+            done++; fails = 0;
+            log(`liked ${tag} (${done}/${want})`);
+          } else {
+            fails++;
+            log(`like did NOT register on ${tag} — X's like button shape may have changed. Stopping to avoid noise.`, 'warn');
+            if (fails >= 3) break;
+          }
           await sleep(jitter(CONFIG.like.minGapMs, CONFIG.like.gapSpread));
         }
-        stable = clicked === 0 ? stable + 1 : 0;
-        window.scrollBy(0, window.innerHeight * 0.9);
-        await sleep(jitter(900, 500));
+
+        if (preview) {
+          // Preview never changes the page, so just walk down it quickly.
+          if (fresh === 0) dryPasses++; else dryPasses = 0;
+          if (done < want) { window.scrollBy(0, window.innerHeight * 0.9); await sleep(250); }
+        } else if (fresh === 0) {
+          window.scrollBy(0, window.innerHeight * 0.9);
+          await sleep(jitter(900, 500));
+        }
       }
-      log(`${CONFIG.dryRun ? '[dryRun] ' : ''}Like run done: ${liked} post(s)${liked >= want ? '' : ' (ran out / stopped)'}. Review & unlike any you don't want, then Harvest from Likes.`);
+      log(preview
+        ? `[dryRun] Preview done: ${done} post(s) shown. Nothing was liked. Toggle "Likes: live" to run it for real.`
+        : `Like run done: ${done} post(s)${done >= want ? '' : ' (ran out / stopped)'}. Review & unlike any you don't want, then Harvest from Likes.`);
     } finally { LIKING = false; }
   }
 
@@ -1031,7 +1096,7 @@
       `videos+caps:${vidPool}  pictures(parked):${picPool}  ready(built):${built}  handed-to-X:${by('scheduled')}`,
       `dead:${by('dead')}  rejected:${by('rejected')}  posted-ids tracked:${postedIds}`,
       `scheduled today:${schedToday}  next:${nextStr}`,
-      `preset:${CONFIG.active} (${p.postsPerSession}×${p.sessions}=${perDay}/day)  start:${CONFIG.startTime}  gap:${CONFIG.gapMinutes > 0 ? CONFIG.gapMinutes + 'min drip' : 'bursts'}  daysAhead:${CONFIG.daysAhead}  cap:${CONFIG.dailyCap}/day  mixPics:${CONFIG.mixPictures}  dryRun:${CONFIG.dryRun}`,
+      `preset:${CONFIG.active} (${p.postsPerSession}×${p.sessions}=${perDay}/day)  start:${CONFIG.startTime}  gap:${CONFIG.gapMinutes > 0 ? CONFIG.gapMinutes + 'min drip' : 'bursts'}  daysAhead:${CONFIG.daysAhead}  cap:${CONFIG.dailyCap}/day  mixPics:${CONFIG.mixPictures}  postDryRun:${CONFIG.dryRun}  likes:${CONFIG.likeDryRun ? 'dry' : 'LIVE'}`,
     ].join('\n');
   }
 
@@ -1447,9 +1512,13 @@
         <div style="display:flex;gap:4px;margin-bottom:6px;align-items:center">
           <button data-a="like" style="flex:2;background:#b25">Like search</button>
           <input id="xbs-liken" type="number" min="1" inputmode="numeric" placeholder="50"
-            title="How many posts in view to like (default 50). Run this on a SEARCH page you've filtered. Obeys dryRun — flip dryRun off to actually like."
+            title="How many posts in view to like (default 50). Run this on a SEARCH page you've filtered."
             style="width:46px;background:#0b1015;color:#fff;border:1px solid #38444d;border-radius:6px;padding:2px 4px;text-align:center"/>
           <button data-a="search" style="flex:1;background:#158">Search</button>
+        </div>
+        <div style="display:flex;gap:4px;margin-bottom:6px">
+          <button data-a="likemode" style="flex:1;background:#555" id="xbs-likemode"
+            title="Separate from posting. DRY = preview only. LIVE = actually likes (asks once per page load).">Likes: dry</button>
         </div>
         <div style="display:flex;gap:4px;margin-bottom:6px">
           <button data-a="status" style="flex:1">Status</button>
@@ -1491,6 +1560,18 @@
         spreadShuffleQueue(el && el.value ? Number(el.value) : 10); },
       like: () => { const el = document.getElementById('xbs-liken');
         likeVisible(el && el.value ? Number(el.value) : 0); },
+      likemode: () => {
+        CONFIG.likeDryRun = !CONFIG.likeDryRun;
+        saveSettings();
+        const b = document.getElementById('xbs-likemode');
+        if (b) {
+          b.textContent = `Likes: ${CONFIG.likeDryRun ? 'dry' : 'live'}`;
+          b.style.background = CONFIG.likeDryRun ? '#555' : '#b25';
+        }
+        log(CONFIG.likeDryRun
+          ? 'Likes: DRY — Like search only previews; nothing is liked. (Posting is unaffected.)'
+          : 'Likes: LIVE — Like search will really like posts, asking once per page load. Posting stays in its own dry mode.');
+      },
       status: () => log(statusSummary()),
       timing: editTiming,
       clear: clearQueued,
@@ -1546,6 +1627,11 @@
     if (pb) pb.textContent = `Photos: ${CONFIG.harvestPhotos ? 'on' : 'off'}`;
     const mb = document.getElementById('xbs-mixpics');
     if (mb) mb.textContent = `Mix Pics: ${CONFIG.mixPictures ? 'on' : 'off'}`;
+    const lb = document.getElementById('xbs-likemode');
+    if (lb) {
+      lb.textContent = `Likes: ${CONFIG.likeDryRun ? 'dry' : 'live'}`;
+      lb.style.background = CONFIG.likeDryRun ? '#555' : '#b25';
+    }
     log(`ready — ${statusSummary()}`);
   }
 
