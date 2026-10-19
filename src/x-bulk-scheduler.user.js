@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X Bulk Scheduler
 // @namespace    x-bulk-scheduler
-// @version      0.10.0
+// @version      0.11.0
 // @description  Harvest video links from bookmarks/likes/official promo posts, prune dead links, and hand them to X's native scheduler. Mobile-friendly (Firefox Android + Tampermonkey).
 // @updateURL    https://raw.githubusercontent.com/eleven-smg/x-bulk-scheduler/main/src/x-bulk-scheduler.user.js
 // @downloadURL  https://raw.githubusercontent.com/eleven-smg/x-bulk-scheduler/main/src/x-bulk-scheduler.user.js
@@ -123,9 +123,63 @@
   const BOOKMARK_REMOVE_MAPPED = false;
 
   // --------------------------------------------------------------- STORAGE
-  const KEYS = { queue: 'xbs_queue', posted: 'xbs_posted_ids', log: 'xbs_log',
-    captions: 'xbs_captions', delcand: 'xbs_delete_candidates',
-    lasthv: 'xbs_last_harvest', settings: 'xbs_settings' };
+  // PER-ACCOUNT POOLS. Tampermonkey storage is per BROWSER PROFILE, so up to 5
+  // X accounts signed into the same Firefox/Brave share one storage blob. The
+  // pool keys are therefore namespaced by the logged-in handle, so account A's
+  // likes are never posted by account B. Settings, captions and the log stay
+  // shared on purpose (they're not account data).
+  const ACCOUNT_KEY = 'xbs_account';
+  let ACCOUNT = GM_getValue(ACCOUNT_KEY, '') || '';
+  const scopedKey = (base) => (ACCOUNT ? `${base}::${ACCOUNT}` : base);
+
+  const KEYS = { log: 'xbs_log', captions: 'xbs_captions',
+    delcand: 'xbs_delete_candidates', settings: 'xbs_settings' };
+  // queue / posted / last-harvest resolve through scopedKey at CALL time, so a
+  // handle detected after load still routes to the right account pool.
+  Object.defineProperty(KEYS, 'queue', { get: () => scopedKey('xbs_queue') });
+  Object.defineProperty(KEYS, 'posted', { get: () => scopedKey('xbs_posted_ids') });
+  Object.defineProperty(KEYS, 'lasthv', { get: () => scopedKey('xbs_last_harvest') });
+
+  const RESERVED = new Set(['home', 'explore', 'notifications', 'messages', 'i',
+    'compose', 'search', 'settings', 'login', 'logout', 'signup', 'tos',
+    'privacy', 'jobs', 'community', 'communities', 'premium', 'account']);
+
+  // Which X account is signed in? The account-switcher avatar and the profile
+  // tab both link to /<handle>. If X changes that markup we return '' and the
+  // pool stays on the shared key rather than guessing the wrong account.
+  function detectAccount() {
+    const tryLink = (a) => {
+      if (!a) return '';
+      const m = (a.getAttribute('href') || '').match(/^\/([A-Za-z0-9_]{1,15})(?:\/|$)/);
+      return m && !RESERVED.has(m[1].toLowerCase()) ? m[1].toLowerCase() : '';
+    };
+    const direct = ['[data-testid="AppTabBar_Profile_Link"]',
+      '[data-testid="SideNav_AccountSwitcher_Button"] a[href^="/"]'];
+    for (const s of direct) { const h = tryLink(document.querySelector(s)); if (h) return h; }
+    const box = document.querySelector('[data-testid="SideNav_AccountSwitcher_Button"], [data-testid="Drawer"]');
+    if (box) {
+      for (const a of box.querySelectorAll('a[href^="/"]')) { const h = tryLink(a); if (h) return h; }
+    }
+    return '';
+  }
+
+  // Switch to an account's pool. First detection on a browser that predates
+  // scoping carries the old shared pool across so nothing harvested is lost.
+  function setAccount(handle, announce) {
+    const h = (handle || '').toLowerCase();
+    if (!h || h === ACCOUNT) return;
+    ACCOUNT = h;
+    GM_setValue(ACCOUNT_KEY, h);
+    try {
+      const legacy = JSON.parse(GM_getValue('xbs_queue', '[]'));
+      const scoped = JSON.parse(GM_getValue(scopedKey('xbs_queue'), '[]'));
+      if (legacy.length && !scoped.length) {
+        GM_setValue(scopedKey('xbs_queue'), JSON.stringify(legacy));
+        if (announce !== false) log(`Account scoping ON for @${h} — carried ${legacy.length} existing link(s) into this account's pool.`, 'warn');
+      }
+    } catch (e) { /* corrupt legacy JSON — leave it alone */ }
+    if (announce !== false) log(`Signed in as @${h} — using that account's own pool.`);
+  }
 
   const store = {
     getQueue() { return JSON.parse(GM_getValue(KEYS.queue, '[]')); },
@@ -1117,6 +1171,8 @@
       queue: GM_getValue(KEYS.queue, '[]'),
       posted: GM_getValue(KEYS.posted, '[]'),
       settings: GM_getValue(KEYS.settings, '{}'),
+      general: GM_getValue(GENERAL_KEY, '[]'),
+      account: ACCOUNT,
       active: CONFIG.active, mix: CONFIG.mixPictures, days: CONFIG.daysAhead,
       cap: CONFIG.dailyCap, start: CONFIG.startTime, gap: CONFIG.gapMinutes,
     };
@@ -1220,12 +1276,47 @@
       let adj = 0; for (let i = 1; i < sp.length; i++)
         if (authorOf(sp[i]) === authorOf(sp[i - 1])) adj++;
       ok('spread separates authors', adj === 0);
+      // -- account scoping: pools are per handle --
+      const prevAcct = ACCOUNT;
+      setAccount('alice', false);
+      ok('scopedKey namespaced', scopedKey('xbs_queue') === 'xbs_queue::alice');
+      setAccount('bob', false);
+      ok('scopedKey switches account', scopedKey('xbs_queue') === 'xbs_queue::bob');
+      ACCOUNT = '';
+      ok('scopedKey unscoped fallback', scopedKey('xbs_queue') === 'xbs_queue');
+      setAccount(prevAcct, false);
+      // -- general queue: dedupe on add, skip posted/queued on pull --
+      setGeneral([]);
+      const g1 = mk(1, 'video'), g2 = mk(2, 'video');
+      ok('general add', generalAdd([g1, g2], 'niche') === 2);
+      ok('general add dedupes', generalAdd([g1], 'niche') === 0);
+      ok('general tag stored', getGeneral().every((x) => x.genTag === 'niche'));
+      store.setQueue([]);
+      store.addPosted('T2');
+      ok('general pull skips posted', generalPull('', 0) === 1 && store.getQueue().length === 1);
+      ok('general pull clears tag', store.getQueue()[0].source === 'general'
+        && !('genTag' in store.getQueue()[0]));
+      ok('general pull dedupes queued', generalPull('', 0) === 0);
+      setGeneral([]);
+      // -- community planner: per-community cap + no repeat of done posts --
+      const cpool = [mk(1, 'video'), mk(2, 'video'), mk(3, 'video'), mk(4, 'video')];
+      cpool[0].communities = ['All'];
+      const plan = planCommunityPosts(
+        { name: 'test', communities: [{ name: 'All', url: 'u1' }, { name: 'Niche', url: 'u2' }] },
+        cpool, 2);
+      ok('community plan caps per community',
+        plan.filter((p) => p.community === 'All').length === 2
+        && plan.filter((p) => p.community === 'Niche').length === 2);
+      ok('community plan skips already-posted community',
+        !plan.some((p) => p.community === 'All' && p.id === 'T1'));
     } catch (e) {
       results.push({ name: 'EXCEPTION: ' + (e && e.message || e), pass: false });
     } finally {
       GM_setValue(KEYS.queue, snap.queue);
       GM_setValue(KEYS.posted, snap.posted);
       GM_setValue(KEYS.settings, snap.settings);
+      GM_setValue(GENERAL_KEY, snap.general);
+      setAccount(snap.account, false);
       CONFIG.active = snap.active; CONFIG.mixPictures = snap.mix;
       CONFIG.daysAhead = snap.days; CONFIG.dailyCap = snap.cap; CONFIG.startTime = snap.start;
       CONFIG.gapMinutes = snap.gap;
@@ -1327,18 +1418,20 @@
   function exportQueue() {
     const blob = {
       exportedAt: new Date().toISOString(),
+      account: ACCOUNT || null,
       queue: store.getQueue(),
       posted: [...store.getPosted()],
+      general: getGeneral(),       // carries the shared queue to another browser
       captions: captions.all(),
     };
     const url = URL.createObjectURL(new Blob([JSON.stringify(blob, null, 2)],
       { type: 'application/json' }));
     const a = document.createElement('a');
     a.href = url;
-    a.download = `xbs-pool-${new Date().toISOString().slice(0, 10)}.json`;
+    a.download = `xbs-pool-${ACCOUNT || 'acct'}-${new Date().toISOString().slice(0, 10)}.json`;
     document.body.appendChild(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 4000);
-    log(`Exported ${blob.queue.length} item(s) + ${blob.posted.length} posted id(s).`);
+    log(`Exported @${ACCOUNT || '?'}: ${blob.queue.length} pool item(s) + ${blob.general.length} general + ${blob.posted.length} posted id(s).`);
   }
 
   function importQueue() {
@@ -1365,7 +1458,12 @@
           });
           store.setQueue([...byId.values()]);
           if (data.captions && Array.isArray(data.captions.pool)) captions.add(data.captions.pool);
-          log(`Imported: ${added} new, ${skipped} skipped (already posted/queued here).`);
+          let genAdded = 0;
+          if (Array.isArray(data.general)) {
+            genAdded = generalAdd(data.general.map((g) => ({ ...g, genFrom: g.genFrom || data.account || 'import' })), null);
+          }
+          log(`Imported @${data.account || '?'}: ${added} new, ${skipped} skipped (already posted/queued here)` +
+            (genAdded ? ` · ${genAdded} general link(s) merged.` : '.'));
           log(statusSummary());
         } catch (e) { log(`Import failed: ${e}`, 'warn'); }
       };
@@ -1374,7 +1472,180 @@
     inp.click();
   }
 
-  // -------------------------------------------------- DELETE TOOL (dry-run scan)
+  // ------------------------------------------------- GENERAL QUEUE (shared)
+  // A browser-wide push/pull pool for moving links between ACCOUNTS and
+  // BROWSERS. Tampermonkey storage is per browser profile, so:
+  //   • same browser (up to 5 accounts): all accounts push/pull the same
+  //     xbs_general key automatically.
+  //   • different browsers (Firefox / Brave / ...): Export includes General and
+  //     Import merges it back, so one file carries the queue across.
+  // Nothing enters General automatically — you decide per item.
+  const GENERAL_KEY = 'xbs_general';
+  function getGeneral() { return JSON.parse(GM_getValue(GENERAL_KEY, '[]')); }
+  function setGeneral(a) { GM_setValue(GENERAL_KEY, JSON.stringify(a)); }
+
+  function generalAdd(items, tag) {
+    const g = getGeneral();
+    const have = new Set(g.map((x) => x.id));
+    let added = 0;
+    (items || []).forEach((it) => {
+      if (have.has(it.id)) return;
+      g.push({ ...it, state: 'general', genTag: tag || 'all', genFrom: ACCOUNT || '?',
+        genAt: new Date().toISOString(), day: 0, session: 0, slot: 0, scheduledAt: null });
+      have.add(it.id); added++;
+    });
+    setGeneral(g);
+    return added;
+  }
+
+  function generalPull(tag, n) {
+    const g = getGeneral();
+    const posted = store.getPosted();
+    const q = store.getQueue();
+    const qIds = new Set(q.map((x) => x.id));
+    const wantTag = (tag || '').trim().toLowerCase();
+    const cap = Number(n) > 0 ? Number(n) : 0;
+    let added = 0;
+    for (const it of g) {
+      if (cap && added >= cap) break;
+      if (wantTag && wantTag !== 'all' && (it.genTag || 'all') !== wantTag) continue;
+      if (posted.has(it.id) || qIds.has(it.id)) continue;
+      const { genTag, genFrom, genAt, ...rest } = it;   // strip general-only metadata
+      q.push({ ...rest, source: 'general', state: 'queued', day: 0, session: 0,
+        slot: 0, scheduledAt: null, errors: [] });
+      qIds.add(it.id); added++;
+    }
+    store.setQueue(q);
+    return added;
+  }
+
+  // Panel flow: choose which of THIS account's links to share, then a tag.
+  function addToGeneral() {
+    const scope = prompt(
+      `Add to GENERAL queue (shared with your other accounts/browsers).\n\n` +
+      `all    = every queued link in this account\n` +
+      `last   = just the last harvest\n` +
+      `ids    = paste status links/ids (comma-separated)\n\nWhich?`, 'last');
+    if (!scope) return;
+    const q = store.getQueue();
+    let items = [];
+    const s = scope.trim().toLowerCase();
+    if (s === 'all') items = q.filter((x) => x.state === 'queued');
+    else if (s === 'last') {
+      const last = JSON.parse(GM_getValue(KEYS.lasthv, '{"ids":[]}'));
+      const ids = new Set(last.ids || []);
+      items = q.filter((x) => ids.has(x.id));
+    } else {
+      const terms = scope.split(/[,\s]+/).filter(Boolean);
+      const ids = new Set(terms.map((t) => extractStatusId(t) || t));
+      items = q.filter((x) => ids.has(x.id));
+    }
+    if (!items.length) { log('Nothing matched — nothing added to General.', 'warn'); return; }
+    const tag = prompt('Tag this batch so accounts can pull only what fits.\nBlank = all.\n(e.g. all, niche, longform)', 'all') || 'all';
+    const added = generalAdd(items, tag.trim() || 'all');
+    log(`General: added ${added} link(s) tagged "${tag.trim() || 'all'}" (from @${ACCOUNT || 'unknown'}). Total in General: ${getGeneral().length}.`);
+  }
+
+  function pullFromGeneral() {
+    const before = getGeneral().length;
+    if (!before) { log('General queue is empty on this browser. Export it from the other browser and Import here.', 'warn'); return; }
+    const tag = prompt(`Pull from GENERAL into @${ACCOUNT || 'this account'}.\n\nTag to pull (blank/all = everything), or type "all".`, 'all');
+    if (tag === null) return;
+    const n = prompt('How many? Blank = all available.', '');
+    const added = generalPull(tag.trim(), n && Number(n) > 0 ? Number(n) : 0);
+    log(added
+      ? `General: pulled ${added} link(s) into this account. Tap Shuffle/Build.`
+      : 'General: nothing new to pull (all already queued or posted here).', added ? undefined : 'warn');
+  }
+
+  // ------------------------------------------- COMMUNITY COLLECTIONS (planner)
+  // X's native scheduler only handles personal posts — community posts can't be
+  // scheduled, so community posting is a NOW action you run while at the phone.
+  // This planner decides WHICH links go to WHICH community (capped, no repeats)
+  // and saves the plan; the click-through path stays gated until a community
+  // compose page is DOM-mapped (COMMUNITY_MAPPED).
+  const COMMUNITY_MAPPED = false;
+  const COMMUNITY_KEY = 'xbs_communities';
+  const COMMUNITY_PLAN_KEY = 'xbs_community_plan';
+  function getCollections() { return JSON.parse(GM_getValue(COMMUNITY_KEY, '[]')); }
+  function setCollections(a) { GM_setValue(COMMUNITY_KEY, JSON.stringify(a)); }
+
+  // Pure allocation: for each community in the collection, take up to `per`
+  // queued links that this account hasn't already posted to that community.
+  function planCommunityPosts(collection, queue, perCommunity) {
+    const cap = Math.max(1, Math.floor(Number(perCommunity) || 3));
+    const pool = queue.filter((x) => x.state === 'queued');
+    const plan = [];
+    ((collection && collection.communities) || []).forEach((c) => {
+      let taken = 0;
+      for (const it of pool) {
+        if (taken >= cap) break;
+        if ((it.communities || []).includes(c.name)) continue;
+        plan.push({ community: c.name, url: c.url, id: it.id, link: it.url });
+        taken++;
+      }
+    });
+    return plan;
+  }
+
+  function editCollections() {
+    const cols = getCollections();
+    const names = cols.map((c) => `${c.name}(${(c.communities || []).length})`).join(', ') || '(none yet)';
+    const what = prompt(
+      `COMMUNITY COLLECTIONS — ${names}\n\n` +
+      `new    = create a collection (e.g. "all content")\n` +
+      `comm   = add a community to a collection\n` +
+      `plan   = plan posts for a collection now\n` +
+      `list   = show collections\n` +
+      `del    = delete a collection\n\nType one:`, 'list');
+    if (!what) return;
+    const op = what.trim().toLowerCase();
+    if (op === 'new') {
+      const name = prompt('Collection name (e.g. "all content", "niche"):');
+      if (!name || !name.trim()) return;
+      if (cols.some((c) => c.name.toLowerCase() === name.trim().toLowerCase())) { log('That collection already exists.', 'warn'); return; }
+      cols.push({ name: name.trim(), communities: [] });
+      setCollections(cols);
+      log(`Collection "${name.trim()}" created. Add communities with "comm".`);
+    } else if (op === 'comm') {
+      if (!cols.length) { log('No collections yet — create one first.', 'warn'); return; }
+      const cname = prompt(`Collection?\n${cols.map((c) => c.name).join(' / ')}`, cols[0].name);
+      const col = cols.find((c) => c.name.toLowerCase() === String(cname || '').trim().toLowerCase());
+      if (!col) { log('Collection not found.', 'warn'); return; }
+      const url = prompt('Community URL (open the community and paste the address bar, e.g. https://x.com/i/communities/123456):');
+      if (!url || !/^https?:\/\/x\.com\//.test(url.trim())) { log('That is not an x.com URL — nothing added.', 'warn'); return; }
+      const cname2 = prompt('Short name for this community:', url.trim().split('/').pop());
+      if (!cname2) return;
+      col.communities.push({ name: cname2.trim(), url: url.trim() });
+      setCollections(cols);
+      log(`Added "${cname2.trim()}" to "${col.name}" (${col.communities.length} communities).`);
+    } else if (op === 'plan') {
+      if (!cols.length) { log('No collections yet.', 'warn'); return; }
+      const cname = prompt(`Plan for which collection?\n${cols.map((c) => c.name).join(' / ')}`, cols[0].name);
+      const col = cols.find((c) => c.name.toLowerCase() === String(cname || '').trim().toLowerCase());
+      if (!col) { log('Collection not found.', 'warn'); return; }
+      const per = prompt('How many posts per community this session? (e.g. 3)', '3');
+      const plan = planCommunityPosts(col, store.getQueue(), per);
+      GM_setValue(COMMUNITY_PLAN_KEY, JSON.stringify({ at: new Date().toISOString(), collection: col.name, plan }));
+      log(`Community plan for "${col.name}": ${plan.length} post(s) across ${col.communities.length} community(ies).`);
+      plan.slice(0, 12).forEach((p) => log(`  ${p.community} ← ${p.id}`));
+      log(COMMUNITY_MAPPED
+        ? 'Run it from the panel.'
+        : 'Saved as a plan only — community posting click-through is not mapped yet (needs one Inspect of a community page). Nothing posted.');
+    } else if (op === 'del') {
+      const cname = prompt(`Delete which collection?\n${cols.map((c) => c.name).join(' / ')}`);
+      const i = cols.findIndex((c) => c.name.toLowerCase() === String(cname || '').trim().toLowerCase());
+      if (i < 0) { log('Not found.', 'warn'); return; }
+      const gone = cols.splice(i, 1)[0];
+      setCollections(cols);
+      log(`Deleted collection "${gone.name}".`);
+    } else {
+      cols.forEach((c) => log(`${c.name}: ${(c.communities || []).map((x) => x.name).join(', ') || '(empty)'}`));
+      if (!cols.length) log('No collections yet — type "new" to create one.');
+    }
+  }
+
+
   // SCANS ONLY. Never deletes. Lists what a given rule WOULD delete so the
   // owner can confirm before any live delete is ever built (Phase 3, gated).
   // Run this on your OWN profile page (x.com/<yourhandle>).
@@ -1543,6 +1814,14 @@
           <button data-a="reset"   style="flex:1;background:#a01">Reset (re-harvest)</button>
         </div>
         <div style="display:flex;gap:4px;margin-bottom:6px">
+          <button data-a="gento" style="flex:1;background:#275"
+            title="Copy links from THIS account's pool into the browser-wide General queue (tagged), so other accounts can pull them.">To General</button>
+          <button data-a="genfrom" style="flex:1;background:#275"
+            title="Pull links from the General queue into THIS account's pool.">From General</button>
+          <button data-a="communities" style="flex:1;background:#654"
+            title="Collections of communities + a per-session posting plan (plan only until community compose is mapped).">Communities</button>
+        </div>
+        <div style="display:flex;gap:4px;margin-bottom:6px">
           <button data-a="selftest" style="flex:1;background:#26a">Self-Test (logic)</button>
           <button data-a="probe" style="flex:1;background:#1a6">Probe (run tests)</button>
         </div>
@@ -1614,6 +1893,9 @@
           ? 'Mix Pics ON — parked pictures will be scheduled alongside videos. Tap Shuffle/Build to fold them in.'
           : 'Mix Pics OFF — pictures stay parked (saved) and are NOT scheduled until you turn this on.');
       },
+      gento: addToGeneral,
+      genfrom: pullFromGeneral,
+      communities: editCollections,
       probe,
     };
     wrap.querySelectorAll('button[data-a]').forEach((b) =>
@@ -1638,12 +1920,20 @@
   // ----------------------------------------------------------------- INIT
   function init() {
     if (!document.body) { setTimeout(init, 500); return; }
+    // Route storage to the signed-in account before anything reads the pool.
+    const h = detectAccount();
+    if (h) setAccount(h, false);
     buildPanel();
   }
   init();
-  // Re-attach panel across X's client-side navigations.
-  new MutationObserver(() => { if (!document.getElementById('xbs-panel')) buildPanel(); })
-    .observe(document.documentElement, { childList: true, subtree: true });
+  // Re-attach panel across X's client-side navigations, and re-detect the
+  // account if the user switches accounts without a full page reload.
+  let lastSeenAccount = ACCOUNT;
+  new MutationObserver(() => {
+    if (!document.getElementById('xbs-panel')) buildPanel();
+    const h = detectAccount();
+    if (h && h !== lastSeenAccount) { lastSeenAccount = h; setAccount(h, true); }
+  }).observe(document.documentElement, { childList: true, subtree: true });
 
   // Test hook — a NO-OP under Tampermonkey (module is undefined there). Lets the
   // local node harness (test/selftest.node.js) import the pure logic and run
@@ -1654,6 +1944,10 @@
       spreadSameAuthor, authorOf, isSchedulable, isPhotoItem, buildSearchUrl,
       synToken, originalFromSyndication, isTombstone, buildUrl, extractStatusId,
       statusSummary,
+      // v0.11.0: account scoping + general queue + community planner
+      scopedKey, setAccount, getAccount: () => ACCOUNT,
+      getGeneral, setGeneral, generalAdd, generalPull,
+      planCommunityPosts, getCollections, setCollections,
     };
   }
 })();
