@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X Bulk Scheduler
 // @namespace    x-bulk-scheduler
-// @version      0.11.0
+// @version      0.11.1
 // @description  Harvest video links from bookmarks/likes/official promo posts, prune dead links, and hand them to X's native scheduler. Mobile-friendly (Firefox Android + Tampermonkey).
 // @updateURL    https://raw.githubusercontent.com/eleven-smg/x-bulk-scheduler/main/src/x-bulk-scheduler.user.js
 // @downloadURL  https://raw.githubusercontent.com/eleven-smg/x-bulk-scheduler/main/src/x-bulk-scheduler.user.js
@@ -165,20 +165,34 @@
 
   // Switch to an account's pool. First detection on a browser that predates
   // scoping carries the old shared pool across so nothing harvested is lost.
-  function setAccount(handle, announce) {
-    const h = (handle || '').toLowerCase();
-    if (!h || h === ACCOUNT) return;
-    ACCOUNT = h;
-    GM_setValue(ACCOUNT_KEY, h);
+  // One-time bridge from the pre-scoping shared pool. It must run ONCE, not per
+  // account, or the second account you sign into would inherit the first's pool.
+  function migrateLegacyPool() {
+    if (GM_getValue('xbs_legacy_migrated', '') === '1') return 0;
     try {
       const legacy = JSON.parse(GM_getValue('xbs_queue', '[]'));
       const scoped = JSON.parse(GM_getValue(scopedKey('xbs_queue'), '[]'));
       if (legacy.length && !scoped.length) {
         GM_setValue(scopedKey('xbs_queue'), JSON.stringify(legacy));
-        if (announce !== false) log(`Account scoping ON for @${h} — carried ${legacy.length} existing link(s) into this account's pool.`, 'warn');
+        GM_setValue('xbs_legacy_migrated', '1');
+        return legacy.length;
       }
+      if (legacy.length) GM_setValue('xbs_legacy_migrated', '1');
     } catch (e) { /* corrupt legacy JSON — leave it alone */ }
-    if (announce !== false) log(`Signed in as @${h} — using that account's own pool.`);
+    return 0;
+  }
+
+  function setAccount(handle, announce) {
+    const h = (handle || '').toLowerCase();
+    if (!h || h === ACCOUNT) return;
+    ACCOUNT = h;
+    GM_setValue(ACCOUNT_KEY, h);
+    const carried = migrateLegacyPool();
+    if (announce !== false) {
+      log(carried
+        ? `Account scope ON for @${h} — carried ${carried} existing link(s) into this pool.`
+        : `Signed in as @${h} — using that account's own pool.`, carried ? 'warn' : undefined);
+    }
   }
 
   const store = {
@@ -1309,6 +1323,13 @@
         && plan.filter((p) => p.community === 'Niche').length === 2);
       ok('community plan skips already-posted community',
         !plan.some((p) => p.community === 'All' && p.id === 'T1'));
+      // Second plan with the first plan's ids recorded must pick different links.
+      const doneMap = { All: ['T2', 'T3'], Niche: ['T2', 'T3'] };
+      const plan2 = planCommunityPosts(
+        { name: 'test', communities: [{ name: 'All', url: 'u1' }, { name: 'Niche', url: 'u2' }] },
+        cpool, 2, doneMap);
+      ok('community plan does not repeat previous plan',
+        plan2.every((p) => !doneMap[p.community].includes(p.id)));
     } catch (e) {
       results.push({ name: 'EXCEPTION: ' + (e && e.message || e), pass: false });
     } finally {
@@ -1567,19 +1588,23 @@
   const COMMUNITY_MAPPED = false;
   const COMMUNITY_KEY = 'xbs_communities';
   const COMMUNITY_PLAN_KEY = 'xbs_community_plan';
+  const COMMUNITY_DONE_KEY = 'xbs_community_done';
   function getCollections() { return JSON.parse(GM_getValue(COMMUNITY_KEY, '[]')); }
   function setCollections(a) { GM_setValue(COMMUNITY_KEY, JSON.stringify(a)); }
 
   // Pure allocation: for each community in the collection, take up to `per`
   // queued links that this account hasn't already posted to that community.
-  function planCommunityPosts(collection, queue, perCommunity) {
+  function planCommunityPosts(collection, queue, perCommunity, alreadyDone) {
     const cap = Math.max(1, Math.floor(Number(perCommunity) || 3));
     const pool = queue.filter((x) => x.state === 'queued');
+    const done = alreadyDone || {};
     const plan = [];
     ((collection && collection.communities) || []).forEach((c) => {
+      const posted = new Set(done[c.name] || []);
       let taken = 0;
       for (const it of pool) {
         if (taken >= cap) break;
+        if (posted.has(it.id)) continue;
         if ((it.communities || []).includes(c.name)) continue;
         plan.push({ community: c.name, url: c.url, id: it.id, link: it.url });
         taken++;
@@ -1625,9 +1650,16 @@
       const col = cols.find((c) => c.name.toLowerCase() === String(cname || '').trim().toLowerCase());
       if (!col) { log('Collection not found.', 'warn'); return; }
       const per = prompt('How many posts per community this session? (e.g. 3)', '3');
-      const plan = planCommunityPosts(col, store.getQueue(), per);
+      // Remember what was already planned for each community so a second plan
+      // picks different links instead of repeating the same ones.
+      let done = {};
+      try { done = JSON.parse(GM_getValue(COMMUNITY_DONE_KEY, '{}')) || {}; } catch (e) { done = {}; }
+      const plan = planCommunityPosts(col, store.getQueue(), per, done);
+      plan.forEach((p) => { (done[p.community] = done[p.community] || []).push(p.id); });
+      GM_setValue(COMMUNITY_DONE_KEY, JSON.stringify(done));
       GM_setValue(COMMUNITY_PLAN_KEY, JSON.stringify({ at: new Date().toISOString(), collection: col.name, plan }));
       log(`Community plan for "${col.name}": ${plan.length} post(s) across ${col.communities.length} community(ies).`);
+      if (!plan.length) log('  ↳ no fresh links left for these communities — harvest more first.', 'warn');
       plan.slice(0, 12).forEach((p) => log(`  ${p.community} ← ${p.id}`));
       log(COMMUNITY_MAPPED
         ? 'Run it from the panel.'
@@ -1929,8 +1961,14 @@
   // Re-attach panel across X's client-side navigations, and re-detect the
   // account if the user switches accounts without a full page reload.
   let lastSeenAccount = ACCOUNT;
+  let lastAcctCheck = 0;
   new MutationObserver(() => {
     if (!document.getElementById('xbs-panel')) buildPanel();
+    // X mutates the DOM constantly; checking the account on every mutation is a
+    // lot of work on a phone. Once per 2 s is plenty for an account switch.
+    const now = Date.now();
+    if (now - lastAcctCheck < 2000) return;
+    lastAcctCheck = now;
     const h = detectAccount();
     if (h && h !== lastSeenAccount) { lastSeenAccount = h; setAccount(h, true); }
   }).observe(document.documentElement, { childList: true, subtree: true });
