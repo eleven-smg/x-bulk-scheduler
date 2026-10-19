@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X Bulk Scheduler
 // @namespace    x-bulk-scheduler
-// @version      0.12.0
+// @version      0.13.0
 // @description  Harvest video links from bookmarks/likes/official promo posts, prune dead links, and hand them to X's native scheduler. Mobile-friendly (Firefox Android + Tampermonkey).
 // @updateURL    https://raw.githubusercontent.com/eleven-smg/x-bulk-scheduler/main/src/x-bulk-scheduler.user.js
 // @downloadURL  https://raw.githubusercontent.com/eleven-smg/x-bulk-scheduler/main/src/x-bulk-scheduler.user.js
@@ -89,6 +89,11 @@
     // posts). Same shape as likes: its own persisted switch, confirm-once per
     // page load, one post per tap. Default dry = logs the plan step only.
     communityDryRun: true,
+    // Which community collection each posting session uses, e.g.
+    // { "1": "all content", "2": "niche" } (keys are 1-based session numbers).
+    // Set from Communities → sess. Community posts run NOW, so this drives the
+    // planner + Post Community rather than X's scheduler.
+    sessionCollections: {},
     // Search-harvest defaults (Phase: search). X search operators.
     search: {
       minFaves: 1000,       // only videos with >= this many likes
@@ -221,7 +226,7 @@
   // panel are persisted here and re-applied at startup. Only these whitelisted
   // fields are user-editable from the panel (never dryRun — going live stays a
   // deliberate code change so nothing posts by accident).
-  const SETTABLE = ['active', 'startTime', 'gapMinutes', 'daysAhead', 'dailyCap', 'harvestPhotos', 'mixPictures', 'likeDryRun', 'communityDryRun'];
+  const SETTABLE = ['active', 'startTime', 'gapMinutes', 'daysAhead', 'dailyCap', 'harvestPhotos', 'mixPictures', 'likeDryRun', 'communityDryRun', 'sessionCollections'];
   function loadSettings() {
     let s = {};
     try { s = JSON.parse(GM_getValue(KEYS.settings, '{}')) || {}; } catch (e) { s = {}; }
@@ -1335,6 +1340,7 @@
         cpool, 2, doneMap);
       ok('community plan does not repeat previous plan',
         plan2.every((p) => !doneMap[p.community].includes(p.id)));
+      ok('session collections persist (in SETTABLE)', SETTABLE.includes('sessionCollections'));
     } catch (e) {
       results.push({ name: 'EXCEPTION: ' + (e && e.message || e), pass: false });
     } finally {
@@ -1728,11 +1734,33 @@
       col.communities.push({ name: cname2.trim(), url: url.trim() });
       setCollections(cols);
       log(`Added "${cname2.trim()}" to "${col.name}" (${col.communities.length} communities).`);
+    } else if (op === 'sess') {
+      // Assign one collection per posting session (1..sessions of the preset).
+      if (!cols.length) { log('No collections yet — create one first.', 'warn'); return; }
+      const p = CONFIG.presets[CONFIG.active];
+      const map = Object.assign({}, CONFIG.sessionCollections || {});
+      for (let s = 1; s <= p.sessions; s++) {
+        const cur = map[String(s)] || '(none)';
+        const v = prompt(`Session ${s} — collection?\nOptions: ${cols.map((c) => c.name).join(' / ')}\nBlank = keep (${cur}).`, cur === '(none)' ? '' : cur);
+        if (v === null) break;
+        if (!v.trim()) continue;
+        if (v.trim().toLowerCase() === 'none' || v.trim() === '-') { delete map[String(s)]; continue; }
+        const col = cols.find((c) => c.name.toLowerCase() === v.trim().toLowerCase());
+        if (!col) { log(`"${v.trim()}" isn't a collection — session ${s} kept as is.`, 'warn'); continue; }
+        map[String(s)] = col.name;
+      }
+      CONFIG.sessionCollections = map;
+      saveSettings();
+      log('Session collections: ' + (Object.keys(map).sort().map((k) => `S${k}=${map[k]}`).join(', ') || '(none set)'));
     } else if (op === 'plan') {
       if (!cols.length) { log('No collections yet.', 'warn'); return; }
-      const cname = prompt(`Plan for which collection?\n${cols.map((c) => c.name).join(' / ')}`, cols[0].name);
+      const sessN = prompt('Which session is this for? (1, 2, …)\nBlank = choose the collection by hand.', '');
+      const sessCol = sessN && (CONFIG.sessionCollections || {})[String(Number(sessN))];
+      const cname = prompt(`Plan for which collection?\n${cols.map((c) => c.name).join(' / ')}`,
+        sessCol || cols[0].name);
       const col = cols.find((c) => c.name.toLowerCase() === String(cname || '').trim().toLowerCase());
       if (!col) { log('Collection not found.', 'warn'); return; }
+      if (sessN) log(`Planning session ${Number(sessN)}${sessCol ? ` (assigned: "${sessCol}")` : ' (no collection assigned — using "' + col.name + '")'}.`);
       const per = prompt('How many posts per community this session? (e.g. 3)', '3');
       // Remember what was already planned for each community so a second plan
       // picks different links instead of repeating the same ones.
@@ -2091,7 +2119,7 @@
       // v0.11.0: account scoping + general queue + community planner
       scopedKey, setAccount, getAccount: () => ACCOUNT,
       getGeneral, setGeneral, generalAdd, generalPull,
-      planCommunityPosts, getCollections, setCollections,
+      planCommunityPosts, getCollections, setCollections, SETTABLE,
     };
   }
 })();
