@@ -17,7 +17,7 @@
 // ==/UserScript==
 
 /*
- * STATUS: v0.4.0 — dry-run harvest confirmed on-device (11 links exported).
+ * STATUS: v0.13.0 — dry-run harvest confirmed on-device (11 links exported).
  * This build fixes what that run exposed:
  *  - Bookmarks/Likes moved to the unified History page (x.com/i/history[/likes]).
  *  - Wrapper links: a bookmarked/liked post that only EMBEDS another post's video

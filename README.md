@@ -9,7 +9,7 @@ X's native scheduler. Mobile-friendly (Firefox Android + Tampermonkey).
 Open this raw link in a browser that has Tampermonkey installed — Tampermonkey
 will offer to install it, and will auto-update from the same URL afterwards:
 
-**[Install / update](x-bulk-scheduler.user.js)**
+**[Install / update](src/x-bulk-scheduler.user.js)**
 
 Once installed, new versions are picked up automatically (Tampermonkey checks
 periodically, or use its "Check for userscript updates").
