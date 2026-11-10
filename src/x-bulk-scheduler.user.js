@@ -1897,14 +1897,25 @@
     wrap.id = 'xbs-panel';
     wrap.style.cssText = 'position:fixed;z-index:99999;right:8px;bottom:8px;width:230px;font:12px/1.4 sans-serif;background:#15202b;color:#fff;border:1px solid #38444d;border-radius:10px;padding:8px;box-shadow:0 4px 12px rgba(0,0,0,.4)';
     wrap.innerHTML = `
+      <style>
+        #xbs-panel button[data-a="fixlinks"], #xbs-panel button[data-a="shuffle"],
+        #xbs-panel button[data-a="spread"], #xbs-panel button[data-a="like"],
+        #xbs-panel button[data-a="search"], #xbs-panel button[data-a="likemode"],
+        #xbs-panel button[data-a="stop"], #xbs-panel button[data-a="reset"],
+        #xbs-panel button[data-a="gento"], #xbs-panel button[data-a="genfrom"],
+        #xbs-panel button[data-a="communities"], #xbs-panel button[data-a="commnext"],
+        #xbs-panel button[data-a="commmode"], #xbs-panel button[data-a="selftest"] { color:#fff; }
+        #xbs-panel button:focus-visible, #xbs-panel input:focus-visible,
+        #xbs-panel #xbs-log:focus-visible { outline:2px solid #ffdf6e; outline-offset:2px; }
+      </style>
       <div style="display:flex;justify-content:space-between;align-items:center">
         <b>X Bulk Scheduler</b>
-        <span id="xbs-min" style="cursor:pointer;padding:0 6px">_</span>
+        <button type="button" id="xbs-min" aria-label="Minimize panel" aria-controls="xbs-body" aria-expanded="true" style="cursor:pointer;padding:0 6px">_</button>
       </div>
       <div id="xbs-body">
         <div style="display:flex;flex-wrap:wrap;gap:4px;margin:6px 0">
           <button data-a="harvest" style="flex:2">Harvest</button>
-          <input id="xbs-hvn" type="number" min="0" inputmode="numeric" placeholder="all"
+          <input id="xbs-hvn" type="number" min="0" inputmode="numeric" placeholder="all" aria-label="Number of new posts to harvest"
             title="How many NEW posts to grab. Blank = just the newly-added ones at the top. A number (e.g. 100) fast-forwards past what you already harvested and grabs that many older ones."
             style="width:46px;background:#0b1015;color:#fff;border:1px solid #38444d;border-radius:6px;padding:2px 4px;text-align:center"/>
           <button data-a="build"   style="flex:1">Build</button>
@@ -1918,13 +1929,13 @@
             title="Free Shuffle: fully random reorder of the whole pool (no value used).">Free Shuffle</button>
           <button data-a="spread" style="flex:2;background:#537"
             title="Spread Shuffle: uses the number box. Splits links into groups of N in the order you liked them, then deals one from a different group at a time so similar/adjacent likes land far apart.">Spread Shuffle</button>
-          <input id="xbs-shufn" type="number" min="2" inputmode="numeric" placeholder="10"
+          <input id="xbs-shufn" type="number" min="2" inputmode="numeric" placeholder="10" aria-label="Spread shuffle group size"
             title="Spread Shuffle group size (default 10). Bigger = bigger groups; smaller spreads similar links wider apart."
             style="width:46px;background:#0b1015;color:#fff;border:1px solid #38444d;border-radius:6px;padding:2px 4px;text-align:center"/>
         </div>
         <div style="display:flex;gap:4px;margin-bottom:6px;align-items:center">
           <button data-a="like" style="flex:2;background:#b25">Like search</button>
-          <input id="xbs-liken" type="number" min="1" inputmode="numeric" placeholder="50"
+          <input id="xbs-liken" type="number" min="1" inputmode="numeric" placeholder="50" aria-label="Number of search posts to like"
             title="How many posts in view to like (default 50). Run this on a SEARCH page you've filtered."
             style="width:46px;background:#0b1015;color:#fff;border:1px solid #38444d;border-radius:6px;padding:2px 4px;text-align:center"/>
           <button data-a="search" style="flex:1;background:#158">Search</button>
@@ -1973,7 +1984,7 @@
           <button data-a="selftest" style="flex:1;background:#26a">Self-Test (logic)</button>
           <button data-a="probe" style="flex:1;background:#1a6">Probe (run tests)</button>
         </div>
-        <pre id="xbs-log" style="height:120px;overflow:auto;background:#0b1015;margin:0;padding:4px;border-radius:6px;white-space:pre-wrap"></pre>
+        <pre id="xbs-log" tabindex="0" role="log" aria-label="Scheduler activity" aria-live="polite" style="height:120px;overflow:auto;background:#0b1015;margin:0;padding:4px;border-radius:6px;white-space:pre-wrap"></pre>
       </div>`;
     document.body.appendChild(wrap);
 
@@ -2061,9 +2072,13 @@
     };
     wrap.querySelectorAll('button[data-a]').forEach((b) =>
       b.addEventListener('click', () => acts[b.dataset.a]()));
-    wrap.querySelector('#xbs-min').addEventListener('click', () => {
+    wrap.querySelector('#xbs-min').addEventListener('click', (event) => {
       const body = wrap.querySelector('#xbs-body');
-      body.style.display = body.style.display === 'none' ? 'block' : 'none';
+      const expanded = body.style.display === 'none';
+      body.style.display = expanded ? 'block' : 'none';
+      event.currentTarget.setAttribute('aria-expanded', String(expanded));
+      event.currentTarget.setAttribute('aria-label', expanded ? 'Minimize panel' : 'Expand panel');
+      event.currentTarget.textContent = expanded ? '_' : '+';
     });
     // Reflect persisted toggle states on the buttons.
     const pb = document.getElementById('xbs-photos');
