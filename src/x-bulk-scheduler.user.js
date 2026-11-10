@@ -1693,9 +1693,14 @@
   }
 
   async function nextCommunityPost() {
-    let plan = [];
-    try { plan = (JSON.parse(GM_getValue(COMMUNITY_PLAN_KEY, '{}')) || {}).plan || []; } catch (e) { plan = []; }
+    let saved = {};
+    try { saved = JSON.parse(GM_getValue(COMMUNITY_PLAN_KEY, '{}')) || {}; } catch (e) { saved = {}; }
+    const plan = Array.isArray(saved.plan) ? saved.plan : [];
     if (!plan.length) { log('No community plan yet — tap Communities → plan first.', 'warn'); return; }
+    // Legacy or different-account plans remain stored for review, never posted.
+    if (!ACCOUNT || detectAccount() !== ACCOUNT || saved.account !== ACCOUNT) {
+      log('Community plan account is unknown or mismatched; review and rebuild before posting.', 'warn'); return;
+    }
     let done = {};
     try { done = JSON.parse(GM_getValue(COMMUNITY_DONE_KEY, '{}')) || {}; } catch (e) { done = {}; }
     const step = plan.find((p) => !(done[p.community] || []).includes(p.id));
@@ -1703,90 +1708,116 @@
     await postCommunityStep(step);
   }
 
-  function editCollections() {
+  // Edit one setting at a time without invoking community posting.
+  function readEditableCollections() {
     const cols = getCollections();
-    const names = cols.map((c) => `${c.name}(${(c.communities || []).length})`).join(', ') || '(none yet)';
-    const what = prompt(
-      `COMMUNITY COLLECTIONS — ${names}\n\n` +
-      `new    = create a collection (e.g. "all content")\n` +
-      `comm   = add a community to a collection\n` +
-      `plan   = plan posts for a collection now\n` +
-      `list   = show collections\n` +
-      `del    = delete a collection\n\nType one:`, 'list');
-    if (!what) return;
-    const op = what.trim().toLowerCase();
-    if (op === 'new') {
-      const name = prompt('Collection name (e.g. "all content", "niche"):');
-      if (!name || !name.trim()) return;
-      if (cols.some((c) => c.name.toLowerCase() === name.trim().toLowerCase())) { log('That collection already exists.', 'warn'); return; }
-      cols.push({ name: name.trim(), communities: [] });
-      setCollections(cols);
-      log(`Collection "${name.trim()}" created. Add communities with "comm".`);
-    } else if (op === 'comm') {
-      if (!cols.length) { log('No collections yet — create one first.', 'warn'); return; }
-      const cname = prompt(`Collection?\n${cols.map((c) => c.name).join(' / ')}`, cols[0].name);
-      const col = cols.find((c) => c.name.toLowerCase() === String(cname || '').trim().toLowerCase());
-      if (!col) { log('Collection not found.', 'warn'); return; }
-      const url = prompt('Community URL (open the community and paste the address bar, e.g. https://x.com/i/communities/123456):');
-      if (!url || !/^https?:\/\/x\.com\//.test(url.trim())) { log('That is not an x.com URL — nothing added.', 'warn'); return; }
-      const cname2 = prompt('Short name for this community:', url.trim().split('/').pop());
-      if (!cname2) return;
-      col.communities.push({ name: cname2.trim(), url: url.trim() });
-      setCollections(cols);
-      log(`Added "${cname2.trim()}" to "${col.name}" (${col.communities.length} communities).`);
-    } else if (op === 'sess') {
-      // Assign one collection per posting session (1..sessions of the preset).
-      if (!cols.length) { log('No collections yet — create one first.', 'warn'); return; }
-      const p = CONFIG.presets[CONFIG.active];
-      const map = Object.assign({}, CONFIG.sessionCollections || {});
-      for (let s = 1; s <= p.sessions; s++) {
-        const cur = map[String(s)] || '(none)';
-        const v = prompt(`Session ${s} — collection?\nOptions: ${cols.map((c) => c.name).join(' / ')}\nBlank = keep (${cur}).`, cur === '(none)' ? '' : cur);
-        if (v === null) break;
-        if (!v.trim()) continue;
-        if (v.trim().toLowerCase() === 'none' || v.trim() === '-') { delete map[String(s)]; continue; }
-        const col = cols.find((c) => c.name.toLowerCase() === v.trim().toLowerCase());
-        if (!col) { log(`"${v.trim()}" isn't a collection — session ${s} kept as is.`, 'warn'); continue; }
-        map[String(s)] = col.name;
-      }
-      CONFIG.sessionCollections = map;
-      saveSettings();
-      log('Session collections: ' + (Object.keys(map).sort().map((k) => `S${k}=${map[k]}`).join(', ') || '(none set)'));
-    } else if (op === 'plan') {
-      if (!cols.length) { log('No collections yet.', 'warn'); return; }
-      const sessN = prompt('Which session is this for? (1, 2, …)\nBlank = choose the collection by hand.', '');
-      const sessCol = sessN && (CONFIG.sessionCollections || {})[String(Number(sessN))];
-      const cname = prompt(`Plan for which collection?\n${cols.map((c) => c.name).join(' / ')}`,
-        sessCol || cols[0].name);
-      const col = cols.find((c) => c.name.toLowerCase() === String(cname || '').trim().toLowerCase());
-      if (!col) { log('Collection not found.', 'warn'); return; }
-      if (sessN) log(`Planning session ${Number(sessN)}${sessCol ? ` (assigned: "${sessCol}")` : ' (no collection assigned — using "' + col.name + '")'}.`);
-      const per = prompt('How many posts per community this session? (e.g. 3)', '3');
-      // Remember what was already planned for each community so a second plan
-      // picks different links instead of repeating the same ones.
-      let done = {};
-      try { done = JSON.parse(GM_getValue(COMMUNITY_DONE_KEY, '{}')) || {}; } catch (e) { done = {}; }
-      const plan = planCommunityPosts(col, store.getQueue(), per, done);
-      plan.forEach((p) => { (done[p.community] = done[p.community] || []).push(p.id); });
-      GM_setValue(COMMUNITY_DONE_KEY, JSON.stringify(done));
-      GM_setValue(COMMUNITY_PLAN_KEY, JSON.stringify({ at: new Date().toISOString(), collection: col.name, plan }));
-      log(`Community plan for "${col.name}": ${plan.length} post(s) across ${col.communities.length} community(ies).`);
-      if (!plan.length) log('  ↳ no fresh links left for these communities — harvest more first.', 'warn');
-      plan.slice(0, 12).forEach((p) => log(`  ${p.community} ← ${p.id}`));
-      log('Saved. Tap "Post Community" to work through it one post at a time (community posts can\'t be scheduled).');
-    } else if (op === 'del') {
-      const cname = prompt(`Delete which collection?\n${cols.map((c) => c.name).join(' / ')}`);
-      const i = cols.findIndex((c) => c.name.toLowerCase() === String(cname || '').trim().toLowerCase());
-      if (i < 0) { log('Not found.', 'warn'); return; }
-      const gone = cols.splice(i, 1)[0];
-      setCollections(cols);
-      log(`Deleted collection "${gone.name}".`);
-    } else {
-      cols.forEach((c) => log(`${c.name}: ${(c.communities || []).map((x) => x.name).join(', ') || '(empty)'}`));
-      if (!cols.length) log('No collections yet — type "new" to create one.');
-    }
+    if (!Array.isArray(cols) || cols.some((c) => !c || typeof c.name !== 'string'
+        || !Array.isArray(c.communities))) throw new Error('Saved collections need review; nothing was changed.');
+    return JSON.parse(JSON.stringify(cols));
+  }
+  function writeCommunitySetting(key, value) {
+    try { GM_setValue(key, JSON.stringify(value)); }
+    catch (error) { throw new Error('Could not confirm the save. Check saved settings before retrying.'); }
+  }
+  function addCommunityCollection(name) {
+    const value = String(name || '').trim();
+    if (!value) throw new Error('Enter a collection name.');
+    const cols = readEditableCollections();
+    if (cols.some((c) => c.name.toLowerCase() === value.toLowerCase()))
+      throw new Error('That collection already exists.');
+    cols.push({ name: value, communities: [] });
+    writeCommunitySetting(COMMUNITY_KEY, cols);
+  }
+  function validCommunityUrl(url) {
+    let parsed;
+    try { parsed = new URL(String(url || '').trim()); } catch (e) { return false; }
+    return parsed.protocol === 'https:' && parsed.hostname === 'x.com' && !parsed.port
+      && /^\/i\/communities\/\d+\/?$/.test(parsed.pathname)
+      && !parsed.search && !parsed.hash && !parsed.username && !parsed.password;
+  }
+  function addCommunityToCollection(collection, name, url) {
+    const label = String(name || '').trim();
+    let parsed;
+    try { parsed = new URL(String(url || '').trim()); } catch (e) { throw new Error('Enter a valid X community URL.'); }
+    if (!validCommunityUrl(parsed.href))
+      throw new Error('Enter an HTTPS X community URL in the form https://x.com/i/communities/123.');
+    if (!label) throw new Error('Enter a community name.');
+    const cols = readEditableCollections();
+    const col = cols.find((c) => c.name === collection);
+    if (!col) throw new Error('Select an existing collection.');
+    if (col.communities.some((c) => c && (c.url === parsed.href
+        || String(c.name || '').toLowerCase() === label.toLowerCase())))
+      throw new Error('That community name or URL is already in the collection.');
+    col.communities.push({ name: label, url: parsed.href });
+    writeCommunitySetting(COMMUNITY_KEY, cols);
+  }
+  function assignCommunitySession(session, collection) {
+    const n = Number(session);
+    if (!Number.isSafeInteger(n) || n < 1 || n > CONFIG.presets[CONFIG.active].sessions)
+      throw new Error('Enter a valid session number for the active preset.');
+    const cols = readEditableCollections();
+    if (collection && !cols.some((c) => c.name === collection))
+      throw new Error('Select an existing collection.');
+    const saved = JSON.parse(GM_getValue(KEYS.settings, '{}'));
+    if (!saved || typeof saved !== 'object' || Array.isArray(saved))
+      throw new Error('Saved settings need review; nothing was changed.');
+    const existing = saved.sessionCollections === undefined ? {} : saved.sessionCollections;
+    if (!existing || typeof existing !== 'object' || Array.isArray(existing))
+      throw new Error('Saved session settings need review; nothing was changed.');
+    const map = { ...existing };
+    if (collection) map[String(n)] = collection; else delete map[String(n)];
+    writeCommunitySetting(KEYS.settings, { ...saved, sessionCollections: map });
+    CONFIG.sessionCollections = map;
   }
 
+  // Planning and deletion require a review step in the UI. All reads below
+  // reject malformed data rather than replacing or silently repairing it.
+  function communityReviewState(name, rawPer) {
+    const n = Number(rawPer);
+    if (!/^\d+$/.test(String(rawPer)) || !Number.isSafeInteger(n) || n < 1 || n > 100)
+      throw new Error('Enter a whole number from 1 to 100 per community.');
+    if (!ACCOUNT || detectAccount() !== ACCOUNT) throw new Error('Account is unknown or changed; planning is blocked.');
+    const collections = readEditableCollections();
+    const collection = collections.find((c) => c.name === name);
+    if (!collection) throw new Error('Select an existing collection.');
+    const seenNames = new Set();
+    for (const c of collection.communities) {
+      if (!c || typeof c.name !== 'string' || !c.name.trim() || typeof c.url !== 'string' || !validCommunityUrl(c.url) || seenNames.has(c.name.trim().toLowerCase()))
+        throw new Error('Community records need review; no plan was created.');
+      seenNames.add(c.name.trim().toLowerCase());
+    }
+    const queue = store.getQueue();
+    if (!Array.isArray(queue) || queue.some((x) => !x || typeof x !== 'object' || Array.isArray(x)))
+      throw new Error('Queue records need review; no plan was created.');
+    const eligible = queue.filter((x) => x.state === 'queued' && (x.kind || 'link') === 'link' && typeof x.url === 'string' && typeof x.id === 'string' && x.id);
+    if (new Set(eligible.map((x) => x.id)).size !== eligible.length)
+      throw new Error('Duplicate queued link IDs need review; no plan was created.');
+    const done = JSON.parse(GM_getValue(COMMUNITY_DONE_KEY, '{}'));
+    const prior = JSON.parse(GM_getValue(COMMUNITY_PLAN_KEY, '{}'));
+    if (!done || typeof done !== 'object' || Array.isArray(done) || Object.values(done).some((x) => !Array.isArray(x)) ||
+        !prior || typeof prior !== 'object' || Array.isArray(prior) || (prior.plan !== undefined && !Array.isArray(prior.plan)))
+      throw new Error('Saved community plan data needs review; nothing was changed.');
+    const plan = planCommunityPosts(collection, eligible, n, done);
+    return { plan, fingerprint: JSON.stringify({ collections, queue, done, prior, account: ACCOUNT, name, n }), replacing: !!(prior.plan && prior.plan.length) };
+  }
+  function deleteCommunityCollection(name, expectedCollections) {
+    const cols = readEditableCollections();
+    if (JSON.stringify(cols) !== expectedCollections) throw new Error('Collections changed since review. Review again.');
+    const index = cols.findIndex((c) => c.name === name);
+    if (index < 0) throw new Error('Select an existing collection.');
+    const saved = JSON.parse(GM_getValue(KEYS.settings, '{}'));
+    const prior = JSON.parse(GM_getValue(COMMUNITY_PLAN_KEY, '{}'));
+    if (!saved || typeof saved !== 'object' || Array.isArray(saved) ||
+        (saved.sessionCollections !== undefined && (!saved.sessionCollections || typeof saved.sessionCollections !== 'object' || Array.isArray(saved.sessionCollections))) ||
+        !prior || typeof prior !== 'object' || Array.isArray(prior) || (prior.plan !== undefined && !Array.isArray(prior.plan)))
+      throw new Error('Saved settings or plan need review; nothing was deleted.');
+    if (Object.values(saved.sessionCollections || {}).includes(name))
+      throw new Error('Clear session assignments for this collection before deleting it.');
+    if (prior.plan && prior.plan.length && (!prior.collection || prior.collection === name))
+      throw new Error('An existing community plan may reference this collection; review it first.');
+    cols.splice(index, 1);
+    writeCommunitySetting(COMMUNITY_KEY, cols);
+  }
 
   // SCANS ONLY. Never deletes. Lists what a given rule WOULD delete so the
   // owner can confirm before any live delete is ever built (Phase 3, gated).
@@ -1960,9 +1991,38 @@
             title="Copy links from THIS account's pool into the browser-wide General queue (tagged), so other accounts can pull them.">To General</button>
           <button data-a="genfrom" style="flex:1;background:#275"
             title="Pull links from the General queue into THIS account's pool.">From General</button>
-          <button data-a="communities" style="flex:1;background:#654"
+          <button data-a="communities" aria-expanded="false" aria-controls="xbs-community-form" style="flex:1;background:#654"
             title="Collections of communities + a per-session posting plan.">Communities</button>
         </div>
+        <section id="xbs-community-form" aria-label="Community settings" hidden style="margin-bottom:6px">
+          <label for="xbs-community-collection">Collection</label>
+          <select id="xbs-community-collection" style="width:100%"></select>
+          <label for="xbs-collection-name" style="display:block">New collection name</label>
+          <input id="xbs-collection-name" type="text" style="width:95%"/>
+          <button type="button" id="xbs-collection-add">Create collection</button>
+          <label for="xbs-community-name" style="display:block">Community name</label>
+          <input id="xbs-community-name" type="text" style="width:95%"/>
+          <label for="xbs-community-url" style="display:block">Community URL</label>
+          <input id="xbs-community-url" type="url" style="width:95%"/>
+          <button type="button" id="xbs-community-add">Add community</button>
+          <label for="xbs-community-session" style="display:block">Session number</label>
+          <input id="xbs-community-session" type="number" min="1" step="1" inputmode="numeric" style="width:80px"/>
+          <button type="button" id="xbs-community-assign">Assign collection</button>
+          <button type="button" id="xbs-community-unassign">Clear assignment</button>
+          <div id="xbs-community-list" aria-label="Saved collections"></div>
+          <label for="xbs-community-per" style="display:block">Links per community (1–100)</label>
+          <input id="xbs-community-per" type="number" min="1" max="100" step="1" value="3" style="width:80px"/>
+          <button type="button" id="xbs-community-plan-review">Review community plan</button>
+          <div id="xbs-community-plan-review-text" role="status"></div>
+          <button type="button" id="xbs-community-plan-confirm" hidden>Save reviewed plan</button>
+          <button type="button" id="xbs-community-plan-cancel" hidden>Cancel plan review</button>
+          <button type="button" id="xbs-community-delete-review">Review collection deletion</button>
+          <div id="xbs-community-delete-review-text" role="status"></div>
+          <button type="button" id="xbs-community-delete-confirm" hidden>Confirm collection deletion</button>
+          <button type="button" id="xbs-community-delete-cancel" hidden>Cancel deletion</button>
+          <button type="button" id="xbs-community-cancel">Cancel</button>
+          <div id="xbs-community-message" role="status" aria-live="polite"></div>
+        </section>
         <div style="display:flex;gap:4px;margin-bottom:6px">
           <button data-a="commnext" style="flex:2;background:#963"
             title="Post the next planned link into its community (NOW — community posts cannot be scheduled). One tap = one post.">Post Community</button>
@@ -2043,7 +2103,13 @@
       },
       gento: addToGeneral,
       genfrom: pullFromGeneral,
-      communities: editCollections,
+      communities: () => {
+        const form = wrap.querySelector('#xbs-community-form');
+        form.hidden = false;
+        wrap.querySelector('button[data-a="communities"]').setAttribute('aria-expanded', 'true');
+        refreshCommunityCollections();
+        wrap.querySelector('#xbs-community-collection').focus();
+      },
       commnext: nextCommunityPost,
       commmode: () => {
         CONFIG.communityDryRun = !CONFIG.communityDryRun;
@@ -2061,6 +2127,119 @@
     };
     wrap.querySelectorAll('button[data-a]').forEach((b) =>
       b.addEventListener('click', () => acts[b.dataset.a]()));
+    const communityForm = wrap.querySelector('#xbs-community-form');
+    const communitySelect = wrap.querySelector('#xbs-community-collection');
+    const communityMessage = wrap.querySelector('#xbs-community-message');
+    function refreshCommunityCollections() {
+      try {
+        const previous = communitySelect.value;
+        const cols = readEditableCollections();
+        communitySelect.replaceChildren(new Option('Select a collection', ''));
+        cols.forEach((c) => communitySelect.add(new Option(c.name, c.name)));
+        communitySelect.value = cols.some((c) => c.name === previous) ? previous : '';
+        const listing = wrap.querySelector('#xbs-community-list');
+        listing.replaceChildren();
+        if (!cols.length) listing.textContent = 'No saved collections.';
+        cols.forEach((c) => {
+          const row = document.createElement('div');
+          const labels = c.communities.map((item) => item && typeof item.name === 'string' ? item.name : '(invalid community)');
+          row.textContent = `${c.name}: ${labels.join(', ') || '(empty)'}`;
+          listing.appendChild(row);
+        });
+        communityMessage.textContent = '';
+        return true;
+      } catch (error) {
+        communityMessage.textContent = 'Could not read saved collections. Nothing was changed.';
+        return false;
+      }
+    }
+    const closeCommunityForm = () => {
+      clearPlanReview(); clearDeleteReview();
+      communityForm.hidden = true;
+      for (const el of communityForm.querySelectorAll('input')) el.value = '';
+      communityMessage.textContent = '';
+      const trigger = wrap.querySelector('button[data-a="communities"]');
+      trigger.setAttribute('aria-expanded', 'false');
+      trigger.focus();
+    };
+    const doCommunityEdit = (fn, success) => {
+      try {
+        fn();
+        if (refreshCommunityCollections()) communityMessage.textContent = success;
+        else communityMessage.textContent = 'Save attempted, but reloading failed. Check saved settings before retrying.';
+      }
+      catch (error) { communityMessage.textContent = error.message || 'Could not confirm the save. Check settings before retrying.'; }
+    };
+    wrap.querySelector('#xbs-collection-add').addEventListener('click', () =>
+      doCommunityEdit(() => addCommunityCollection(wrap.querySelector('#xbs-collection-name').value), 'Collection saved.'));
+    wrap.querySelector('#xbs-community-add').addEventListener('click', () =>
+      doCommunityEdit(() => addCommunityToCollection(communitySelect.value, wrap.querySelector('#xbs-community-name').value,
+        wrap.querySelector('#xbs-community-url').value), 'Community saved.'));
+    wrap.querySelector('#xbs-community-assign').addEventListener('click', () =>
+      doCommunityEdit(() => {
+        if (!communitySelect.value) throw new Error('Select an existing collection.');
+        assignCommunitySession(wrap.querySelector('#xbs-community-session').value, communitySelect.value);
+      }, 'Session assignment saved.'));
+    wrap.querySelector('#xbs-community-unassign').addEventListener('click', () =>
+      doCommunityEdit(() => assignCommunitySession(wrap.querySelector('#xbs-community-session').value, ''), 'Session assignment cleared.'));
+    let pendingCommunityPlan = null, pendingCommunityDelete = null;
+    const planText = wrap.querySelector('#xbs-community-plan-review-text');
+    const planConfirm = wrap.querySelector('#xbs-community-plan-confirm');
+    const planCancel = wrap.querySelector('#xbs-community-plan-cancel');
+    const deleteText = wrap.querySelector('#xbs-community-delete-review-text');
+    const deleteConfirm = wrap.querySelector('#xbs-community-delete-confirm');
+    const deleteCancel = wrap.querySelector('#xbs-community-delete-cancel');
+    const clearPlanReview = () => { pendingCommunityPlan = null; planText.textContent = ''; planConfirm.hidden = planCancel.hidden = true; };
+    const clearDeleteReview = () => { pendingCommunityDelete = null; deleteText.textContent = ''; deleteConfirm.hidden = deleteCancel.hidden = true; };
+    communitySelect.addEventListener('change', () => { clearPlanReview(); clearDeleteReview(); });
+    wrap.querySelector('#xbs-community-per').addEventListener('input', clearPlanReview);
+    wrap.querySelector('#xbs-community-plan-review').addEventListener('click', () => {
+      clearPlanReview();
+      try {
+        const name = communitySelect.value, per = wrap.querySelector('#xbs-community-per').value;
+        const reviewed = communityReviewState(name, per);
+        pendingCommunityPlan = { name, per, ...reviewed };
+        planText.textContent = `Review: ${reviewed.plan.length} planned link(s) for ${name}. ${reviewed.replacing ? 'Saving replaces the existing plan. ' : ''}No posts will be sent.`;
+        planConfirm.hidden = planCancel.hidden = false;
+        planConfirm.focus();
+      } catch (error) { communityMessage.textContent = error.message || 'Could not review the plan.'; }
+    });
+    planConfirm.addEventListener('click', () => {
+      try {
+        if (!pendingCommunityPlan) throw new Error('Review the plan first.');
+        const current = communityReviewState(pendingCommunityPlan.name, pendingCommunityPlan.per);
+        if (current.fingerprint !== pendingCommunityPlan.fingerprint) throw new Error('Settings or queue changed since review. Review again.');
+        writeCommunitySetting(COMMUNITY_PLAN_KEY, { at: new Date().toISOString(), account: ACCOUNT, collection: pendingCommunityPlan.name, plan: current.plan });
+        clearPlanReview(); communityMessage.textContent = 'Community plan saved. No posts were sent.';
+      } catch (error) { clearPlanReview(); communityMessage.textContent = error.message || 'Could not confirm the plan save.'; }
+    });
+    planCancel.addEventListener('click', () => { clearPlanReview(); wrap.querySelector('#xbs-community-plan-review').focus(); });
+    wrap.querySelector('#xbs-community-delete-review').addEventListener('click', () => {
+      clearDeleteReview();
+      try {
+        const cols = readEditableCollections(), name = communitySelect.value;
+        if (!cols.some((c) => c.name === name)) throw new Error('Select an existing collection.');
+        pendingCommunityDelete = { name, snapshot: JSON.stringify(cols) };
+        deleteText.textContent = `Delete collection “${name}”? This does not remove posts from X.`;
+        deleteConfirm.hidden = deleteCancel.hidden = false;
+        deleteConfirm.focus();
+      } catch (error) { communityMessage.textContent = error.message || 'Could not review the collection.'; }
+    });
+    deleteConfirm.addEventListener('click', () => {
+      try {
+        if (!pendingCommunityDelete) throw new Error('Review the deletion first.');
+        deleteCommunityCollection(pendingCommunityDelete.name, pendingCommunityDelete.snapshot);
+        clearDeleteReview(); clearPlanReview();
+        if (refreshCommunityCollections()) communityMessage.textContent = 'Collection deleted.';
+        else communityMessage.textContent = 'Deletion attempted, but reloading failed. Check before retrying.';
+      } catch (error) { clearDeleteReview(); communityMessage.textContent = error.message || 'Could not confirm deletion.'; }
+    });
+    deleteCancel.addEventListener('click', () => { clearDeleteReview(); wrap.querySelector('#xbs-community-delete-review').focus(); });
+
+    wrap.querySelector('#xbs-community-cancel').addEventListener('click', closeCommunityForm);
+    communityForm.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); closeCommunityForm(); }
+    });
     wrap.querySelector('#xbs-min').addEventListener('click', () => {
       const body = wrap.querySelector('#xbs-body');
       body.style.display = body.style.display === 'none' ? 'block' : 'none';
