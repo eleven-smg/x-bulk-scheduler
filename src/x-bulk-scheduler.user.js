@@ -716,21 +716,28 @@
     const pr = shufflePoolRest();
     if (!pr) return;
     fisherYates(pr.pool);
-    commitShuffle(pr.pool, pr.rest,
+    commitShuffle(pr.pool, pr,
       `Free-shuffled ${pr.pool.length} un-posted link(s) into a random order. Tap Build to re-schedule.`);
   }
 
-  // Shared: pull the schedulable un-posted pool out of the queue. Parked photos
-  // stay in `rest` when Mix Pics is OFF; when ON they're part of the pool.
+  // Keep unschedulable, historical and malformed entries in their original
+  // slots. The movable pool is represented by object identity, not by ID, so
+  // duplicate IDs and metadata are preserved.
   function shufflePoolRest() {
-    const q = store.getQueue();
-    const pool = q.filter((x) => x.state === 'queued' && isSchedulable(x));
-    const rest = q.filter((x) => !(x.state === 'queued' && isSchedulable(x)));
+    const records = store.getQueue();
+    const slots = [];
+    const pool = [];
+    records.forEach((x, index) => {
+      if (x && typeof x === 'object' && x.state === 'queued' && isSchedulable(x)) {
+        slots.push(index);
+        pool.push(x);
+      }
+    });
     if (pool.length < 2) {
       log('Nothing to shuffle — need 2+ un-posted, schedulable links in the pool.', 'warn');
       return null;
     }
-    return { pool, rest };
+    return { records, slots, pool, original: pool.slice() };
   }
   function fisherYates(a) {
     for (let i = a.length - 1; i > 0; i--) {
@@ -741,10 +748,17 @@
   // Commit a freshly-ordered pool as the new posting order + best-effort same-
   // author spacing. A re-shuffle invalidates any stamped schedule, so clear it —
   // Build re-lays the whole pool in the new order.
-  function commitShuffle(pool, rest, msg) {
+  function commitShuffle(pool, snapshot, msg) {
     spreadSameAuthor(pool);
+    if (pool.every((item, i) => item === snapshot.original[i])) {
+      log('Shuffle left the order unchanged; existing plan retained.');
+      return;
+    }
     pool.forEach((x) => { x.scheduledAt = null; x.day = 0; x.session = 0; x.slot = 0; });
-    store.setQueue([...rest, ...pool]);
+    snapshot.slots.forEach((slot, i) => { snapshot.records[slot] = pool[i]; });
+    // A single snapshot write preserves duplicate records, but is not a
+    // cross-tab transaction. Concurrent writes remain an unresolved risk.
+    store.setQueue(snapshot.records);
     log(msg);
   }
 
@@ -761,7 +775,7 @@
     const pr = shufflePoolRest();
     if (!pr) return;
     const n = Math.max(2, Math.floor(Number(groupSize) || 10));
-    const { pool, rest } = pr;
+    const { pool } = pr;
     const groups = [];
     for (let i = 0; i < pool.length; i += n) groups.push(pool.slice(i, i + n));
     groups.forEach(fisherYates);   // shuffle within each group
@@ -773,7 +787,7 @@
       for (const g of live) out.push(g.shift());
       live = live.filter((g) => g.length);
     }
-    commitShuffle(out, rest,
+    commitShuffle(out, pr,
       `Spread-shuffled ${out.length} link(s) in ${groups.length} group(s) of ${n} — similar/adjacent links pulled apart. Tap Build to re-schedule.`);
   }
 
