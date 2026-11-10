@@ -959,21 +959,19 @@
   }
 
   // ---------------------------------------------------- COMPOSER INSERT
-  // Draft.js contenteditable: el.value fails. Try execCommand, then a native
-  // InputEvent fallback. Final method is confirmed by TESTING.md Check 1.
-  function insertIntoComposer(box, text) {
+  // Do not retry an insertion after an uncertain result: execCommand may have
+  // inserted text even when it returns false. Refuse a non-empty text draft.
+  async function insertIntoComposer(box, text) {
+    if (!box || (box.innerText || box.textContent || '').replace(/\u200b/g, '').trim()) return false;
     box.focus();
-    let ok = false;
-    try { ok = document.execCommand('insertText', false, text); } catch (e) { ok = false; }
-    if (!ok || !(box.innerText || '').includes(text)) {
-      box.dispatchEvent(new InputEvent('beforeinput', {
-        inputType: 'insertText', data: text, bubbles: true, cancelable: true,
-      }));
-      box.dispatchEvent(new InputEvent('input', {
-        inputType: 'insertText', data: text, bubbles: true,
-      }));
-    }
-    return (box.innerText || '').includes(text);
+    let ok;
+    try { ok = document.execCommand('insertText', false, text); } catch (e) { return false; }
+    if (!ok) return false;
+    // A short observation catches some delayed rerenders but cannot prove
+    // stability after this window or account for non-text draft attachments.
+    await sleep(500);
+    const normalize = (s) => String(s || '').replace(/\r\n/g, '\n');
+    return box.isConnected && normalize(box.innerText) === normalize(text);
   }
 
   // ------------------------------------------------- SCHEDULE PICKER (DOM)
@@ -1080,7 +1078,7 @@
     await sleep(jitter(2500, 1500));
     const box = document.querySelector(CONFIG.selectors.composerBox);
     if (!box) { item.errors.push('composer not found'); item.state = 'rejected'; store.upsert(item); return false; }
-    if (!insertIntoComposer(box, text)) { item.errors.push('insert failed'); item.state = 'rejected'; store.upsert(item); return false; }
+    if (!(await insertIntoComposer(box, text))) { item.errors.push('insert failed or uncertain'); item.state = 'rejected'; store.upsert(item); return false; }
     try { await setSchedulePicker(item.scheduledAt); } catch (e) { item.errors.push(String(e)); item.state = 'rejected'; store.upsert(item); return false; }
     // Submit the scheduled post via the composer's Post/Schedule button.
     const submit = document.querySelector(CONFIG.selectors.tweetButton);
@@ -1667,7 +1665,7 @@
       log('Community composer not found on this page. Post by hand once, then send me an Inspect so I can map it.', 'warn');
       return false;
     }
-    if (!insertIntoComposer(box, text)) { log('Community insert failed.', 'warn'); return false; }
+    if (!(await insertIntoComposer(box, text))) { log('Community insert failed or uncertain.', 'warn'); return false; }
     await sleep(jitter(900, 400));
     const submit = submitBtnEl();
     if (!submit) { log('Community Post button not found.', 'warn'); return false; }
@@ -2115,7 +2113,7 @@
       CONFIG, store, selfTest, buildSchedule, shuffleQueue, spreadShuffleQueue,
       spreadSameAuthor, authorOf, isSchedulable, isPhotoItem, buildSearchUrl,
       synToken, originalFromSyndication, isTombstone, buildUrl, extractStatusId,
-      statusSummary,
+      statusSummary, insertIntoComposer,
       // v0.11.0: account scoping + general queue + community planner
       scopedKey, setAccount, getAccount: () => ACCOUNT,
       getGeneral, setGeneral, generalAdd, generalPull,
