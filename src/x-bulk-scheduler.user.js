@@ -65,9 +65,8 @@
                             // from bookmarks (trickled) so the backlog frontier
                             // stays at the top. Only acts on source==='bookmarks';
                             // PREVIEWS in log until BOOKMARK_REMOVE_MAPPED is set.
-    useOembedCheck: false,  // Layer-2 dead-link ping. OFF: publish.x.com/oembed
-                            // now returns 402 (paywalled) — see BUGS.md 2026-09-23.
-                            // Tombstone detection (Layer 1) is the free primary.
+    useOembedCheck: false,  // Optional oEmbed reachability gate; off by default.
+                            // A failed lookup is unknown, not proof of deletion.
     timezone: 'Africa/Lagos',
     // Like-bot (collection helper). Likes are used as a harvest surface: like the
     // filtered search results, review/unlike by hand, then Harvest from Likes.
@@ -345,11 +344,10 @@
     return !!article.querySelector(CONFIG.selectors.videoPlayer);
   }
 
-  // Dead posts render as "tombstones" with no media and unavailable text.
-  const TOMBSTONE_RE = /(this post was deleted|this post is unavailable|no longer exists|account.*suspended)/i;
-  function isTombstone(article) {
-    return !isVideoPost(article) && TOMBSTONE_RE.test(article.innerText || '');
-  }
+  // Article text can be authored or belong to a nested quote. It is not
+  // reliable evidence that the parent or its original media was deleted.
+  // Unavailable/no-media posts are still excluded by the existing media filter;
+  // that filter does not classify or record the reason for their absence.
 
   function collectFromView(source, seen, out, stats) {
     stats.domArticles = Math.max(stats.domArticles,
@@ -361,7 +359,6 @@
       if (seen.has(own.id)) { stats.alreadyHad++; return; } // posted/queued/handled
       seen.add(own.id);
       stats.scanned++;
-      if (isTombstone(art)) { stats.tombstone++; log(`tombstone skipped ${own.id}`, 'warn'); return; }
       const mk = mediaKind(art);
       if (!mk) { stats.noMedia++; return; }               // no video/photo media
       if (mk === 'photo' && !CONFIG.harvestPhotos) { stats.photoSkip++; return; } // opt-in
@@ -415,7 +412,7 @@
     const seen = new Set([...posted, ...existing]);
     const hadBacklog = seen.size > 0;
     const found = [];
-    const stats = { domArticles: 0, scanned: 0, noId: 0, tombstone: 0,
+    const stats = { domArticles: 0, scanned: 0, noId: 0,
       noMedia: 0, photoSkip: 0, resolved: 0, queued: 0, alreadyHad: 0,
       cap: target > 0 ? target : Infinity };
     let lastH = 0, stable = 0, prevQ = 0, knownStreak = 0;
@@ -444,7 +441,7 @@
     log(`Harvest done: ${found.length} new ${kind} link(s) queued${hitTarget}.`);
     log(`  scan — posts on page:${stats.domArticles} new:${stats.scanned} `
       + `skipped-known:${stats.alreadyHad} noMedia:${stats.noMedia} `
-      + `photosOff:${stats.photoSkip} tombstone:${stats.tombstone} resolved:${stats.resolved}`);
+      + `photosOff:${stats.photoSkip} resolved:${stats.resolved}`);
     if (!found.length) {
       if (stats.domArticles === 0) log('  ↳ 0 posts on page — you are NOT on the History/Likes list (or it hasn\'t loaded). Scroll once, then Harvest.', 'warn');
       else if (stats.scanned === 0 && stats.alreadyHad > 0) log('  ↳ all visible posts were already harvested. Type a number (e.g. 100) in the box next to Harvest to fast-forward past them into older posts.', 'warn');
@@ -580,25 +577,25 @@
     log(`Inspect: dumped ${articles.length} post(s) → xbs-inspect.json.`);
   }
 
-  // ------------------------------------------------- DEAD-LINK CHECK (oEmbed)
-  // Layer 2: ping oEmbed; dead posts historically returned 404. No API key.
-  // 2026-09-23: publish.x.com/oembed now returns 402 (paywalled) to our tests,
-  // so this is OFF by default (CONFIG.useOembedCheck). Layer 1 (tombstone during
-  // harvest) is the free primary check. Re-verify from a logged-in browser in
-  // DESKTOP-TESTING.md; if it works there, flip useOembedCheck on.
+  // ------------------------------------------------- OPTIONAL oEmbed GATE
+  // This endpoint does not establish that the original post is deleted: 404,
+  // 403, rate limits, timeouts and network errors all have unknown meaning.
+  // A successful response is only an oEmbed response, not an independent proof
+  // of the original's identity or availability.
   function oembedCheck(id, author) {
     return new Promise((resolve) => {
-      if (!CONFIG.useOembedCheck) { resolve(true); return; } // skip → treat alive
-      const bare = `https://x.com/${author || 'i'}/status/${id}`; // no /video/1
-      GM_xmlhttpRequest({
-        method: 'GET',
-        url: `https://publish.x.com/oembed?url=${encodeURIComponent(bare)}`,
-        timeout: 8000,
-        // 404 = dead. 402/others = inconclusive → don't falsely kill it.
-        onload: (r) => resolve(r.status !== 404),
-        onerror: () => resolve(true),
-        ontimeout: () => resolve(true),
-      });
+      if (!CONFIG.useOembedCheck) { resolve('not_checked'); return; }
+      const bare = `https://x.com/${author || 'i'}/status/${id}`;
+      try {
+        GM_xmlhttpRequest({
+          method: 'GET',
+          url: `https://publish.x.com/oembed?url=${encodeURIComponent(bare)}`,
+          timeout: 8000,
+          onload: (r) => resolve(r.status === 200 ? 'response_ok' : 'unknown'),
+          onerror: () => resolve('unknown'),
+          ontimeout: () => resolve('unknown'),
+        });
+      } catch (e) { resolve('unknown'); }
     });
   }
 
@@ -1113,11 +1110,12 @@
       log(`${CONFIG.dryRun ? '[dryRun] ' : ''}running ${items.length} posts…`);
       for (const item of items) {
         if (!RUNNING) { log('Stopped.', 'warn'); break; }
-        // Layer 2 dead-link check right before scheduling — link items only.
+        // Optional reachability check. Failure is inconclusive: preserve the
+        // record and skip this attempt, rather than labeling it dead.
         if ((item.kind || 'link') === 'link' && item.url) {
           const author = (item.url.match(/x\.com\/([^/]+)\/status/) || [])[1];
-          const alive = await oembedCheck(item.id, author);
-          if (!alive) { item.state = 'dead'; store.upsert(item); log(`dead, skipped ${item.id}`, 'warn'); continue; }
+          const result = await oembedCheck(item.id, author);
+          if (result === 'unknown') { log(`availability unknown; skipped ${item.id} without changing its record`, 'warn'); continue; }
         }
         const ok = await schedulePost(item);
         if (ok && CONFIG.unbookmarkAfterPost && item.source === 'bookmarks') {
@@ -1180,7 +1178,7 @@
 
   // ------------------------------------------------------------- SELF-TEST
   // Runs the PURE logic — schedule math, shuffle/spread, picture parking,
-  // search-URL builder, syndication parsing, dead-link regex, id/url helpers —
+  // search-URL builder, syndication parsing, id/url helpers —
   // against synthetic data and reports PASS/FAIL in the panel log. It touches NO
   // X page, makes NO network calls, and posts/likes NOTHING. It snapshots your
   // real queue + settings and RESTORES them in a finally, so it never disturbs
@@ -1223,11 +1221,6 @@
       ok('syn same-id -> null', originalFromSyndication({ quoted_tweet: { id_str: '111' } }, '111') === null);
       ok('synToken format', (() => { const t = synToken('1234567890123456789');
         return typeof t === 'string' && t.length > 0 && !/[0.]/.test(t); })());
-      // -- dead-link (tombstone) regex --
-      const fakeArt = (txt, hasVideo) => ({
-        querySelector: (s) => (hasVideo && /video/i.test(s)) ? {} : null, innerText: txt });
-      ok('tombstone dead', isTombstone(fakeArt('This post was deleted.', false)) === true);
-      ok('tombstone alive', isTombstone(fakeArt('This post was deleted.', true)) === false);
       // -- picture parking / isSchedulable --
       CONFIG.mixPictures = false;
       ok('park photo (mix off)', isSchedulable({ media: 'video' }) === true
@@ -2114,7 +2107,7 @@
     module.exports = {
       CONFIG, store, selfTest, buildSchedule, shuffleQueue, spreadShuffleQueue,
       spreadSameAuthor, authorOf, isSchedulable, isPhotoItem, buildSearchUrl,
-      synToken, originalFromSyndication, isTombstone, buildUrl, extractStatusId,
+      synToken, originalFromSyndication, oembedCheck, collectFromView, runSchedule, buildUrl, extractStatusId,
       statusSummary,
       // v0.11.0: account scoping + general queue + community planner
       scopedKey, setAccount, getAccount: () => ACCOUNT,
