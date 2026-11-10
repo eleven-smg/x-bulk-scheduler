@@ -1360,35 +1360,20 @@
     return { passed, total: results.length, failed: failed.map((r) => r.name) };
   }
 
-  // "Timing" button — edit the schedule shape without touching code (owner is
-  // non-technical). prompt()-based so it works on mobile; persists via saveSettings.
+  // Open the timing form without changing current or saved settings.
   function editTiming() {
-    const presetKeys = Object.keys(CONFIG.presets);
-    const pr = prompt(`Preset — how many posts per day.\nOptions: ${presetKeys.join(' , ')}\nBlank = keep (${CONFIG.active}).`);
-    if (pr && CONFIG.presets[pr.trim()]) CONFIG.active = pr.trim();
-    else if (pr && pr.trim()) { log(`Unknown preset "${pr.trim()}" — kept ${CONFIG.active}.`, 'warn'); }
-
-    const st = prompt(`Daily start time, 24h HH:MM (WAT).\nBlank = keep (${CONFIG.startTime}).`);
-    if (st && /^\d{1,2}:\d{2}$/.test(st.trim())) CONFIG.startTime = st.trim();
-    else if (st && st.trim()) log(`"${st.trim()}" isn't HH:MM — kept ${CONFIG.startTime}.`, 'warn');
-
-    const gm = prompt(`Space between posts, in MINUTES.\n0 = preset bursts (tight, then long gaps).\nAny number = steady drip that many minutes apart (e.g. 30, 60).\nBlank = keep (${CONFIG.gapMinutes}).`);
-    if (gm !== null && gm.trim() !== '') {
-      const v = Number(gm.trim());
-      if (v >= 0 && Number.isFinite(v)) CONFIG.gapMinutes = Math.floor(v);
-      else log(`"${gm.trim()}" isn't a number — kept gap ${CONFIG.gapMinutes} min.`, 'warn');
-    }
-
-    const da = prompt(`How many days ahead to schedule per run.\nBlank = keep (${CONFIG.daysAhead}).`);
-    if (da && Number(da) > 0) CONFIG.daysAhead = Math.floor(Number(da));
-
-    const cap = prompt(`Daily cap (safety ceiling; X free-tier ≈ 50).\nBlank = keep (${CONFIG.dailyCap}).`);
-    if (cap && Number(cap) > 0) CONFIG.dailyCap = Math.floor(Number(cap));
-
-    saveSettings();
-    const p = CONFIG.presets[CONFIG.active];
-    const gapTxt = CONFIG.gapMinutes > 0 ? `${CONFIG.gapMinutes} min apart` : `${CONFIG.active} bursts`;
-    log(`Timing saved: ${CONFIG.active} (${p.postsPerSession * p.sessions}/day), start ${CONFIG.startTime}, ${gapTxt}, ${CONFIG.daysAhead} day(s) ahead, cap ${CONFIG.dailyCap}. Tap Build to apply.`);
+    const form = document.getElementById('xbs-timing-form');
+    const trigger = document.querySelector('#xbs-panel [data-a="timing"]');
+    if (!form || !trigger) return;
+    form.elements.preset.value = CONFIG.active;
+    form.elements.startTime.value = CONFIG.startTime;
+    form.elements.gapMinutes.value = CONFIG.gapMinutes;
+    form.elements.daysAhead.value = CONFIG.daysAhead;
+    form.elements.dailyCap.value = CONFIG.dailyCap;
+    form.querySelector('[role="alert"]').textContent = '';
+    form.hidden = false;
+    trigger.setAttribute('aria-expanded', 'true');
+    form.elements.preset.focus();
   }
 
   // -------------------------------------------------------- CAPTION ENGINE
@@ -1935,10 +1920,20 @@
         </div>
         <div style="display:flex;gap:4px;margin-bottom:6px">
           <button data-a="status" style="flex:1">Status</button>
-          <button data-a="timing" style="flex:1">Timing</button>
+          <button data-a="timing" style="flex:1" aria-expanded="false" aria-controls="xbs-timing-form">Timing</button>
           <button data-a="clear"  style="flex:1">Clear-Q</button>
           <button data-a="stop"   style="flex:1;background:#a01">Stop</button>
         </div>
+        <form id="xbs-timing-form" hidden novalidate style="margin:6px 0;padding:6px;border:1px solid #aaa">
+          <strong>Timing settings</strong>
+          <label style="display:block">Preset <select name="preset"><option value="12x4">12x4</option><option value="10x5">10x5</option></select></label>
+          <label style="display:block">Daily start time (browser local time, HH:MM) <input name="startTime" type="text" inputmode="numeric" placeholder="09:00" style="width:70px" /></label>
+          <label style="display:block">Gap in minutes (0 = bursts) <input name="gapMinutes" type="number" min="0" max="1440" step="1" style="width:70px" /></label>
+          <label style="display:block">Days ahead (1–366) <input name="daysAhead" type="number" min="1" max="366" step="1" style="width:70px" /></label>
+          <label style="display:block">Daily cap (1–1000) <input name="dailyCap" type="number" min="1" max="1000" step="1" style="width:70px" /></label>
+          <p role="alert" style="color:#ffb3b3"></p>
+          <button type="submit">Save timing</button> <button type="button" id="xbs-timing-cancel">Cancel timing</button>
+        </form>
         <div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:6px">
           <button data-a="captions" style="flex:1">Captions</button>
           <button data-a="export"   style="flex:1">Export</button>
@@ -2059,6 +2054,46 @@
       },
       probe,
     };
+    const timingForm = wrap.querySelector('#xbs-timing-form');
+    const timingTrigger = wrap.querySelector('[data-a="timing"]');
+    const closeTiming = () => {
+      timingForm.hidden = true;
+      timingTrigger.setAttribute('aria-expanded', 'false');
+      timingTrigger.focus();
+    };
+    timingForm.querySelector('#xbs-timing-cancel').addEventListener('click', closeTiming);
+    timingForm.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && !timingForm.dataset.busy) { e.preventDefault(); closeTiming(); }
+    });
+    timingForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      if (timingForm.dataset.busy) return;
+      const f = timingForm.elements;
+      const integer = (el, min, max) => /^\d+$/.test(el.value) && Number.isSafeInteger(Number(el.value)) && Number(el.value) >= min && Number(el.value) <= max;
+      const time = /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(f.startTime.value);
+      const error = timingForm.querySelector('[role="alert"]');
+      if (!Object.prototype.hasOwnProperty.call(CONFIG.presets, f.preset.value) || !time ||
+          !integer(f.gapMinutes, 0, 1440) || !integer(f.daysAhead, 1, 366) || !integer(f.dailyCap, 1, 1000)) {
+        error.textContent = 'Use a valid 24-hour time and whole numbers within the stated limits.';
+        return;
+      }
+      const next = { active: f.preset.value, startTime: f.startTime.value, gapMinutes: Number(f.gapMinutes.value), daysAhead: Number(f.daysAhead.value), dailyCap: Number(f.dailyCap.value) };
+      timingForm.dataset.busy = 'true';
+      Array.from(f).forEach((el) => { el.disabled = true; });
+      try {
+        const raw = await Promise.resolve(GM_getValue(KEYS.settings, '{}'));
+        const stored = JSON.parse(raw);
+        if (!stored || typeof stored !== 'object' || Array.isArray(stored)) throw new Error('Invalid saved settings');
+        await Promise.resolve(GM_setValue(KEYS.settings, JSON.stringify({ ...stored, ...next })));
+        Object.assign(CONFIG, next);
+        closeTiming();
+      } catch (err) {
+        error.textContent = 'Could not save timing. Your changes are still here; saved settings were not intentionally replaced.';
+      } finally {
+        delete timingForm.dataset.busy;
+        Array.from(f).forEach((el) => { el.disabled = false; });
+      }
+    });
     wrap.querySelectorAll('button[data-a]').forEach((b) =>
       b.addEventListener('click', () => acts[b.dataset.a]()));
     wrap.querySelector('#xbs-min').addEventListener('click', () => {
