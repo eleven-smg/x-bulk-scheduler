@@ -913,10 +913,16 @@
   function buildSchedule() {
     const p = CONFIG.presets[CONFIG.active];
     const perDay = p.postsPerSession * p.sessions;
-    const all = store.getQueue().filter((x) => x.state === 'queued');
+    const records = store.getQueue();
+    const all = records.filter((x) => x.state === 'queued');
     const queue = all.filter(isSchedulable);
+    // A parked queued photo must not retain a generated time from an earlier
+    // plan. Historical/non-queued records and all other fields are preserved.
+    const parked = all.filter((x) => !isSchedulable(x) && x.scheduledAt != null);
+    parked.forEach((x) => { x.scheduledAt = null; });
     const parkedPics = all.length - queue.length;
     if (!queue.length) {
+      if (parked.length) store.setQueue(records);
       log(parkedPics
         ? `Nothing schedulable — ${parkedPics} picture(s) are parked. Turn Mix Pics ON to include them.`
         : 'Nothing queued to schedule.', 'warn');
@@ -950,9 +956,11 @@
 
       item.day = day; item.session = session; item.slot = slot;
       item.scheduledAt = d.toISOString();
-      store.upsert(item);
       n++;
     }
+    // Save once, preserving duplicates and untouched historical records. This
+    // does not provide atomic cross-tab conflict detection.
+    store.setQueue(records);
     const spacing = evenGapMin > 0 ? `${evenGapMin} min apart (drip)` : `${CONFIG.active} bursts`;
     log(`Schedule built: ${cap} posts across ${Math.ceil(cap / perDay)} day(s), ${spacing}.`
       + (parkedPics ? `  (${parkedPics} picture(s) parked — Mix Pics is OFF.)` : ''));
