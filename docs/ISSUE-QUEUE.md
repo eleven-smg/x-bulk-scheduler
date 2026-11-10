@@ -27,26 +27,24 @@ This file is the public project issue queue. It follows the four-section format 
 
 Counts below cover public project work only. A completed experimental result is not a claim that the public main branch or a deployment contains it.
 
-### A. Unfinished (16)
+### A. Unfinished (14)
 
 | # | ID | Status | Outcome / next action | Evidence or remaining work |
 |---|---|---|---|---|
 | 1 | P20 | ❌ | Prevent saved queue updates from being lost across concurrent writers ([#1](https://github.com/eleven-smg/x-bulk-scheduler/issues/1)). | A direct writer overwrote an update in a synthetic model; revision checks are not atomic. |
 | 2 | P21 | ❌ | Detect missed, delayed and reordered storage changes ([#8](https://github.com/eleven-smg/x-bulk-scheduler/issues/8)). | Real event delivery, batching and A→B→A changes remain unproven. |
-| 3 | P25 | ❌ | Review legacy scheduled markers without assuming delivery ([#9](https://github.com/eleven-smg/x-bulk-scheduler/issues/9)). | Preserve old records; do not assume delivery or migrate automatically. |
-| 4 | P38 | ❌ | Measure Stop responsiveness during a delayed request ([#10](https://github.com/eleven-smg/x-bulk-scheduler/issues/10)). | Measure real delayed-request response; no timing guarantee established. |
-| 5 | P40 | ❌ | Prevent duplicated text in the X composer ([#11](https://github.com/eleven-smg/x-bulk-scheduler/issues/11)). | Earlier live test duplicated inserted text; real editor verification remains. |
-| 6 | P43 | ❌ | Verify X schedule picker timezone and selected instant ([#12](https://github.com/eleven-smg/x-bulk-scheduler/issues/12)). | Check intended WAT instant in actual X picker without submitting a post. |
-| 7 | P45 | ❌ | Replace the unavailable Search prompt with accessible controls ([#13](https://github.com/eleven-smg/x-bulk-scheduler/issues/13)). | Search prompt remains unavailable in the preview build. |
-| 8 | P46 | ❌ | Replace the unavailable caption prompt with accessible controls ([#14](https://github.com/eleven-smg/x-bulk-scheduler/issues/14)). | Caption prompt remains unavailable in the preview build. |
-| 9 | P47 | ❌ | Replace unavailable community-settings prompts safely ([#15](https://github.com/eleven-smg/x-bulk-scheduler/issues/15)). | Settings prompt remains unavailable; do not enable community posting in tests. |
-| 10 | P49 | ❌ | Verify keyboard and screen-reader accessibility ([#16](https://github.com/eleven-smg/x-bulk-scheduler/issues/16)). | Full keyboard and screen-reader acceptance remains open. |
-| 11 | P51 | ❌ | Verify the latest test extension in a supported browser ([#17](https://github.com/eleven-smg/x-bulk-scheduler/issues/17)). | Latest preview extension is uninstalled and not verified. |
-| 12 | P52 | ❎ | Verify userscript installation and operation in Tampermonkey ([#18](https://github.com/eleven-smg/x-bulk-scheduler/issues/18)). | Earlier host blocked user scripts; compatible test environment needed. |
-| 13 | P53 | ❌ | Verify supported desktop and phone environments ([#54](https://github.com/eleven-smg/x-bulk-scheduler/issues/54)). | Verify suitable devices without assuming unsupported installation paths. |
-| 14 | P54 | ❌ | Define and verify a release deployment checklist ([#55](https://github.com/eleven-smg/x-bulk-scheduler/issues/55)). | Current deployed revision is unknown; establish release verification. |
-| 15 | P55 | ❌ | Define a safe real-post scheduling acceptance test ([#56](https://github.com/eleven-smg/x-bulk-scheduler/issues/56)). | Requires a reviewed target, content and explicit authorization before a real test. |
-| 16 | P57 | ❎ | Verify video attribution with independently established saved examples ([#57](https://github.com/eleven-smg/x-bulk-scheduler/issues/57)). | Requires independently established example and a safely authorized test account. |
+| 3 | P38 | ❌ | Measure Stop responsiveness during a delayed request ([#10](https://github.com/eleven-smg/x-bulk-scheduler/issues/10)). | Measure real delayed-request response; no timing guarantee established. |
+| 4 | P40 | ❌ | Prevent duplicated text in the X composer ([#11](https://github.com/eleven-smg/x-bulk-scheduler/issues/11)). | Earlier live test duplicated inserted text; real editor verification remains. |
+| 5 | P43 | ❌ | Verify X schedule picker timezone and selected instant ([#12](https://github.com/eleven-smg/x-bulk-scheduler/issues/12)). | Verify the intended instant in the actual browser-local X picker without submitting a post; DST and selected-instant behavior remain open. |
+| 6 | P45 | ❌ | Replace the unavailable Search prompt with accessible controls ([#13](https://github.com/eleven-smg/x-bulk-scheduler/issues/13)). | Search prompt remains unavailable in the preview build. |
+| 7 | P46 | ❌ | Replace the unavailable caption prompt with accessible controls ([#14](https://github.com/eleven-smg/x-bulk-scheduler/issues/14)). | Caption prompt remains unavailable in the preview build. |
+| 8 | P47 | ❌ | Replace unavailable community-settings prompts safely ([#15](https://github.com/eleven-smg/x-bulk-scheduler/issues/15)). | Settings prompt remains unavailable; do not enable community posting in tests. |
+| 9 | P49 | ❌ | Verify keyboard and screen-reader accessibility ([#16](https://github.com/eleven-smg/x-bulk-scheduler/issues/16)). | Full keyboard and screen-reader acceptance remains open. |
+| 10 | P51 | ❌ | Verify the latest test extension in a supported browser ([#17](https://github.com/eleven-smg/x-bulk-scheduler/issues/17)). | Latest preview extension is uninstalled and not verified. |
+| 11 | P52 | ❎ | Verify userscript installation and operation in Tampermonkey ([#18](https://github.com/eleven-smg/x-bulk-scheduler/issues/18)). | Earlier host blocked user scripts; compatible test environment needed. |
+| 12 | P53 | ❌ | Verify supported desktop and phone environments ([#54](https://github.com/eleven-smg/x-bulk-scheduler/issues/54)). | Verify suitable devices without assuming unsupported installation paths. |
+| 13 | P54 | ❌ | Define and verify a release deployment checklist ([#55](https://github.com/eleven-smg/x-bulk-scheduler/issues/55)). | Current deployed revision is unknown; establish release verification. |
+| 14 | P57 | ❎ | Verify video attribution with independently established saved examples ([#57](https://github.com/eleven-smg/x-bulk-scheduler/issues/57)). | Requires independently established example and a safely authorized test account. |
 
 ### B. Added issues (10)
 
@@ -104,7 +102,7 @@ Counts below cover public project work only. A completed experimental result is 
 | 35 | P48 | ✔️ | Enforce preview-only safety locks in test builds ([#52](https://github.com/eleven-smg/x-bulk-scheduler/issues/52)). | Source locks tested; latest installed extension not verified. |
 | 36 | P50 | ✔️ | Verify responsive interface at narrow and wide sizes ([#53](https://github.com/eleven-smg/x-bulk-scheduler/issues/53)). | Earlier wide/narrow screenshots checked; latest build and devices unverified. |
 
-### D. Completed (5)
+### D. Completed (7)
 
 | # | ID | Status | Outcome | Evidence and scope |
 |---|---|---|---|---|
@@ -113,6 +111,8 @@ Counts below cover public project work only. A completed experimental result is 
 | 3 | P04 | ✅ | Preserve earlier source and history. | Earlier experimental history retained separately; not a published release. |
 | 4 | P56 | ✅ | Compare one public shared-video example independently. | One public example matched in anonymous metadata; not universal correctness. |
 | 5 | P64 | ✅ | Reject malformed video-source URLs in experimental source. | Eight malformed synthetic cases rejected and valid controls passed in test.10. Not yet integrated into main; see P66 and #58. |
+| 6 | P25 | ✅ | Design a non-destructive review of legacy markers ([#9](https://github.com/eleven-smg/x-bulk-scheduler/issues/9)). | [PR #69](https://github.com/eleven-smg/x-bulk-scheduler/pull/69) merged; two synthetic model tests passed. No real delivery is asserted or records migrated. |
+| 7 | P55 | ✅ | Define a safe real-post scheduling acceptance test ([#56](https://github.com/eleven-smg/x-bulk-scheduler/issues/56)). | [PR #65](https://github.com/eleven-smg/x-bulk-scheduler/pull/65) merged; checklist only. No live scheduling test or delivery is claimed. |
 
 ## Session updates — append, never replace
 
@@ -125,3 +125,11 @@ Counts below cover public project work only. A completed experimental result is 
 A separate [feature-by-feature functionality test matrix](FUNCTIONALITY-TESTS.md) records historical tests and outstanding checks. Added P67–P70 for availability evidence, collection, queued plans and selected cleanup. These are open and depend on safe classification; no automatic deletion or cleanup has been implemented. Existing Like/bookmark cleanup issues remain linked, not duplicated. Contributor testing is welcome via the individual `help wanted` issues. No application source was changed.
 
 A new synthetic regression failed: ordinary post text with unavailable wording caused a fictional photo post to be marked as a tombstone in experimental test.10. The issue remains open; see [#59](https://github.com/eleven-smg/x-bulk-scheduler/issues/59#issuecomment-6592825450). The existing worker-free suite was intentionally rerun and passed; browser and real-X testing were skipped.
+
+### Project review follow-up
+
+Current public main before this documentation update was `35f46ceec3e45e1b182373f09444e88a65875b9f`; its userscript is byte-identical to the source at `09462e216a7936d1b7d84e0e77505aca8425bcc7` from the historical report. The report and its screenshots are historical evidence, not a current installed or deployed test. It references an experimental `0.13.1-test.10` package and private replay fixtures, neither present in this repository or supplied as source in the report. Do not publish private fixtures or account data.
+
+[PR #64](https://github.com/eleven-smg/x-bulk-scheduler/pull/64) merged a release provenance checklist; [#55](https://github.com/eleven-smg/x-bulk-scheduler/issues/55) remains open because no installed release was verified. PR #69 completed the manual-review design in #9, not real delivery verification. PR #65 completed the written plan in #56, not a live post.
+
+Code changes remain unmerged drafts: [#63](https://github.com/eleven-smg/x-bulk-scheduler/pull/63), [#66](https://github.com/eleven-smg/x-bulk-scheduler/pull/66), [#67–#68](https://github.com/eleven-smg/x-bulk-scheduler/pulls), and [#70–#80](https://github.com/eleven-smg/x-bulk-scheduler/pulls). Test current integration and installed behavior before release; multiple branches edit the same userscript. The latest [contribution tracker](https://github.com/dhillic/x-bulk-scheduler/blob/docs/contribution-tracker/CONTRIBUTION-STATUS.md) records individual PRs, exact test commands and caveats.
