@@ -1100,11 +1100,16 @@
 
   // ------------------------------------------------------------ ORCHESTRATE
   let RUNNING = false;
+  // A stopped run must stay stopped even if another run starts before a
+  // delayed callback from the old one arrives.
+  let RUN_GENERATION = 0;
   let RESOLVING = false;
 
   async function runSchedule() {
     if (RUNNING) { log('Already running.', 'warn'); return; }
     RUNNING = true;
+    const generation = ++RUN_GENERATION;
+    const isCurrent = () => RUNNING && RUN_GENERATION === generation;
     try {
       const items = store.getQueue()
         .filter((x) => x.state === 'queued' && x.scheduledAt)
@@ -1112,21 +1117,25 @@
       if (!items.length) { log('Nothing to run — tap Build first.', 'warn'); return; }
       log(`${CONFIG.dryRun ? '[dryRun] ' : ''}running ${items.length} posts…`);
       for (const item of items) {
-        if (!RUNNING) { log('Stopped.', 'warn'); break; }
+        if (!isCurrent()) break;
         // Layer 2 dead-link check right before scheduling — link items only.
         if ((item.kind || 'link') === 'link' && item.url) {
           const author = (item.url.match(/x\.com\/([^/]+)\/status/) || [])[1];
           const alive = await oembedCheck(item.id, author);
+          if (!isCurrent()) break;
           if (!alive) { item.state = 'dead'; store.upsert(item); log(`dead, skipped ${item.id}`, 'warn'); continue; }
         }
         const ok = await schedulePost(item);
+        if (!isCurrent()) break;
         if (ok && CONFIG.unbookmarkAfterPost && item.source === 'bookmarks') {
           await unbookmarkAfterPost(item);
         }
         await sleep(jitter(1500, 1500)); // trickle writes, human-ish
       }
-      log('Run complete.');
-    } finally { RUNNING = false; }
+      if (isCurrent()) log('Run complete.');
+    } finally {
+      if (RUN_GENERATION === generation) RUNNING = false;
+    }
   }
 
   // Trickled unbookmark once a bookmarked item is safely scheduled — the
@@ -1145,6 +1154,7 @@
 
   function panic() {
     RUNNING = false;
+    RUN_GENERATION++;
     RESOLVING = false;
     LIKING = false;
     log('PANIC: run halted. In-flight items left as-is.', 'warn');
