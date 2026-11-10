@@ -12,3 +12,6 @@ xbs-*.json
 test/
 # Never publish the MCP config — it points at a token env var, keep it local.
 .mcp.json
+
+# Node dependencies for synthetic browser tests.
+node_modules/

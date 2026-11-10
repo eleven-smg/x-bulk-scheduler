@@ -1,0 +1,10 @@
+{
+  "name": "x-bulk-scheduler",
+  "private": true,
+  "scripts": {
+    "test:search": "node --test tests/search-form.browser.test.js"
+  },
+  "devDependencies": {
+    "playwright": "1.65.0"
+  }
+}

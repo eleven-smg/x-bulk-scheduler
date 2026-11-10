@@ -13,3 +13,19 @@ will offer to install it, and will auto-update from the same URL afterwards:
 
 Once installed, new versions are picked up automatically (Tampermonkey checks
 periodically, or use its "Check for userscript updates").
+
+## Synthetic Search regression test
+
+The Search form has a local browser test with fictional input. All requests
+are intercepted; it does not connect to X or use an account.
+
+```sh
+npm ci
+npx playwright install chromium
+npm run test:search
+```
+
+To use an existing compatible Chromium, set
+`PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` to its executable path instead of running
+`playwright install`. This test does not verify the installed userscript, X's
+live interface or screen-reader behavior.

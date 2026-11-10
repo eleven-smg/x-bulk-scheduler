@@ -526,14 +526,12 @@
     return `https://x.com/search?q=${encodeURIComponent(parts.filter(Boolean).join(' '))}&f=live`;
   }
   function openSearch() {
-    const term = prompt(
-      `Search keyword (e.g. your client's name).\nWill be filtered to native videos`
-      + `${CONFIG.search.minFaves ? ` with ≥${CONFIG.search.minFaves} likes` : ''}`
-      + `${CONFIG.search.excludeReplies ? ', no replies' : ''}.`);
-    if (term === null) return;
-    const url = buildSearchUrl(term);
-    log(`Opening filtered search: q="${decodeURIComponent(url.split('q=')[1].split('&')[0])}" (Latest tab). Then tap Like search, or Harvest from your Likes after.`);
-    location.assign(url);
+    const form = document.getElementById('xbs-search-form');
+    const input = document.getElementById('xbs-search-term');
+    const button = document.querySelector('#xbs-panel button[data-a="search"]');
+    form.hidden = false;
+    button.setAttribute('aria-expanded', 'true');
+    input.focus();
   }
 
   // Read-only DOM dump of the first few posts in the current view: own id, every
@@ -1927,8 +1925,17 @@
           <input id="xbs-liken" type="number" min="1" inputmode="numeric" placeholder="50"
             title="How many posts in view to like (default 50). Run this on a SEARCH page you've filtered."
             style="width:46px;background:#0b1015;color:#fff;border:1px solid #38444d;border-radius:6px;padding:2px 4px;text-align:center"/>
-          <button data-a="search" style="flex:1;background:#158">Search</button>
+          <button data-a="search" aria-expanded="false" aria-controls="xbs-search-form" style="flex:1;background:#158">Search</button>
         </div>
+        <form id="xbs-search-form" hidden style="margin-bottom:6px">
+          <label for="xbs-search-term">Search keyword</label>
+          <input id="xbs-search-term" type="text" autocomplete="off" aria-describedby="xbs-search-help xbs-search-error"
+            style="box-sizing:border-box;width:100%;background:#0b1015;color:#fff;border:1px solid #82909c;border-radius:6px;padding:4px"/>
+          <div id="xbs-search-help">Opens a filtered X search; no posts or likes are sent.</div>
+          <div id="xbs-search-error" role="alert"></div>
+          <button type="submit">Open search</button>
+          <button type="button" id="xbs-search-cancel">Cancel</button>
+        </form>
         <div style="display:flex;gap:4px;margin-bottom:6px">
           <button data-a="likemode" style="flex:1;background:#555" id="xbs-likemode"
             title="Separate from posting. DRY = preview only. LIVE = actually likes (asks once per page load).">Likes: dry</button>
@@ -2061,6 +2068,43 @@
     };
     wrap.querySelectorAll('button[data-a]').forEach((b) =>
       b.addEventListener('click', () => acts[b.dataset.a]()));
+    const searchForm = wrap.querySelector('#xbs-search-form');
+    const searchInput = wrap.querySelector('#xbs-search-term');
+    const searchError = wrap.querySelector('#xbs-search-error');
+    const closeSearch = () => {
+      searchForm.hidden = true;
+      searchForm.reset();
+      searchError.textContent = '';
+      searchInput.removeAttribute('aria-invalid');
+      const button = wrap.querySelector('button[data-a="search"]');
+      button.setAttribute('aria-expanded', 'false');
+      button.focus();
+    };
+    wrap.querySelector('#xbs-search-cancel').addEventListener('click', closeSearch);
+    searchForm.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        event.stopPropagation();
+        closeSearch();
+      }
+    });
+    searchInput.addEventListener('input', () => {
+      searchError.textContent = '';
+      searchInput.removeAttribute('aria-invalid');
+    });
+    searchForm.addEventListener('submit', (event) => {
+      event.preventDefault();
+      const term = searchInput.value.trim();
+      if (!term) {
+        searchError.textContent = 'Enter a search keyword.';
+        searchInput.setAttribute('aria-invalid', 'true');
+        searchInput.focus();
+        return;
+      }
+      const url = buildSearchUrl(term);
+      log(`Opening filtered search: q="${decodeURIComponent(url.split('q=')[1].split('&')[0])}" (Latest tab). Then tap Like search, or Harvest from your Likes after.`);
+      location.assign(url);
+    });
     wrap.querySelector('#xbs-min').addEventListener('click', () => {
       const body = wrap.querySelector('#xbs-body');
       body.style.display = body.style.display === 'none' ? 'block' : 'none';
