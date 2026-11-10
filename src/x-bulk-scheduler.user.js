@@ -313,13 +313,13 @@
   // Same-id links (analytics/photo) are ignored. author 'i' → unknown handle; we
   // keep the id and let x.com/i/status/<id> redirect to the canonical post.
   function resolveEmbeddedStatus(art, ownId) {
+    // Parse only a literal supported relative status path. Do not let a
+    // prefix match, URL normalization, whitespace, encodings or extra path
+    // segments turn malformed input into source evidence.
     const parse = (href) => {
-      const m = (href || '').match(/^\/(?:([^/]+)\/)?(?:i\/)?status\/(\d+)/)
-        || (href || '').match(/^\/([^/]+)\/status\/(\d+)/);
+      const m = typeof href === 'string' && href.match(/^\/([A-Za-z0-9_]{1,15})\/status\/(\d+)(?:\/(?:video|photo)\/[1-9]\d*)?(?![\s\S])/);
       if (!m) return null;
-      const id = m[2] || m[1];               // guard against shape drift
-      const author = (m[1] && m[1] !== 'i' && m[1] !== 'status') ? m[1] : null;
-      return /^\d+$/.test(id) ? { id, author } : null;
+      return { id: m[2], author: m[1].toLowerCase() === 'i' ? null : m[1] };
     };
     // (1) Attribution badge first (highest confidence).
     const attr = art.querySelector(
@@ -2114,7 +2114,7 @@
     module.exports = {
       CONFIG, store, selfTest, buildSchedule, shuffleQueue, spreadShuffleQueue,
       spreadSameAuthor, authorOf, isSchedulable, isPhotoItem, buildSearchUrl,
-      synToken, originalFromSyndication, isTombstone, buildUrl, extractStatusId,
+      synToken, originalFromSyndication, isTombstone, resolveEmbeddedStatus, buildUrl, extractStatusId,
       statusSummary,
       // v0.11.0: account scoping + general queue + community planner
       scopedKey, setAccount, getAccount: () => ACCOUNT,
