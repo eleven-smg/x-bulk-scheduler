@@ -1418,9 +1418,9 @@
     },
   };
 
-  // Queue N caption-only items (kind:'caption', no url) then stamp times via
-  // the same buildSchedule() slotting. captions-only mode == this + Run.
-  function buildCaptionSchedule(n) {
+  // Queue caption-only items without rebuilding unrelated queue plans.
+  // The separate Build action schedules them when the owner is ready.
+  function queueCaptions(n) {
     const pool = captions.all().pool;
     if (!pool.length) { log('Caption pool empty — add captions first.', 'warn'); return; }
     const count = Math.max(1, Number(n) || 0);
@@ -1439,7 +1439,6 @@
       });
     }
     log(`Queued ${count} caption post(s). Tap Build to stamp times, then Run.`);
-    buildSchedule();
   }
 
   // ------------------------------------------------- SHARED POOL (export/import)
@@ -1940,11 +1939,24 @@
           <button data-a="stop"   style="flex:1;background:#a01">Stop</button>
         </div>
         <div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:6px">
-          <button data-a="captions" style="flex:1">Captions</button>
+          <button data-a="captions" aria-expanded="false" aria-controls="xbs-caption-form" style="flex:1">Captions</button>
           <button data-a="export"   style="flex:1">Export</button>
           <button data-a="import"   style="flex:1">Import</button>
           <button data-a="delscan"  style="flex:1">Del-Scan</button>
         </div>
+        <section id="xbs-caption-form" aria-label="Caption controls" hidden style="margin-bottom:6px">
+          <label for="xbs-caption-text">New captions, one per line</label>
+          <textarea id="xbs-caption-text" rows="4" aria-describedby="xbs-caption-help xbs-caption-message"
+            style="box-sizing:border-box;width:100%;background:#0b1015;color:#fff;border:1px solid #82909c;border-radius:6px;padding:4px"></textarea>
+          <div id="xbs-caption-help">Add captions first, then optionally queue saved captions. Queueing does not post.</div>
+          <button type="button" id="xbs-caption-add">Add captions</button>
+          <label for="xbs-caption-count" style="display:block">Number of saved captions to queue</label>
+          <input id="xbs-caption-count" type="number" min="1" max="1000" step="1" inputmode="numeric"
+            aria-describedby="xbs-caption-message" style="width:80px;background:#0b1015;color:#fff;border:1px solid #82909c;border-radius:6px;padding:4px"/>
+          <button type="button" id="xbs-caption-queue">Queue captions</button>
+          <button type="button" id="xbs-caption-cancel">Cancel</button>
+          <div id="xbs-caption-message" role="status" aria-live="polite"></div>
+        </section>
         <div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:6px">
           <button data-a="undo"    style="flex:1">Undo Hv</button>
           <button data-a="remove"  style="flex:1">Remove</button>
@@ -2008,10 +2020,10 @@
       export: exportQueue,
       import: importQueue,
       captions: () => {
-        const raw = prompt('Paste captions (one per line) to ADD to the pool, or leave blank to just schedule from the existing pool:');
-        if (raw && raw.trim()) log(`Caption pool now ${captions.add(raw.split('\n'))} entr(y/ies).`);
-        const n = prompt('How many caption-only posts to queue now? (blank = skip)');
-        if (n && Number(n) > 0) buildCaptionSchedule(n);
+        const form = wrap.querySelector('#xbs-caption-form');
+        form.hidden = false;
+        wrap.querySelector('button[data-a="captions"]').setAttribute('aria-expanded', 'true');
+        wrap.querySelector('#xbs-caption-text').focus();
       },
       delscan: () => {
         const rule = prompt(`Delete-SCAN (dry-run, deletes nothing). Rule?\n${DELETE_RULES.join(' / ')}`, 'liveMedia');
@@ -2061,6 +2073,70 @@
     };
     wrap.querySelectorAll('button[data-a]').forEach((b) =>
       b.addEventListener('click', () => acts[b.dataset.a]()));
+    const captionForm = wrap.querySelector('#xbs-caption-form');
+    const captionText = wrap.querySelector('#xbs-caption-text');
+    const captionCount = wrap.querySelector('#xbs-caption-count');
+    const captionMessage = wrap.querySelector('#xbs-caption-message');
+    const closeCaptions = () => {
+      captionForm.hidden = true;
+      captionText.value = '';
+      captionCount.value = '';
+      captionText.removeAttribute('aria-invalid');
+      captionCount.removeAttribute('aria-invalid');
+      captionMessage.textContent = '';
+      const trigger = wrap.querySelector('button[data-a="captions"]');
+      trigger.setAttribute('aria-expanded', 'false');
+      trigger.focus();
+    };
+    wrap.querySelector('#xbs-caption-cancel').addEventListener('click', closeCaptions);
+    captionForm.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        event.stopPropagation();
+        closeCaptions();
+      }
+    });
+    captionText.addEventListener('input', () => captionText.removeAttribute('aria-invalid'));
+    captionCount.addEventListener('input', () => captionCount.removeAttribute('aria-invalid'));
+    wrap.querySelector('#xbs-caption-add').addEventListener('click', () => {
+      if (!captionText.value.trim()) {
+        captionText.setAttribute('aria-invalid', 'true');
+        captionMessage.textContent = 'Enter at least one caption to add.';
+        captionText.focus();
+        return;
+      }
+      try {
+        const count = captions.add(captionText.value.split('\n'));
+        captionMessage.textContent = `Caption pool now has ${count} entries.`;
+        captionText.value = '';
+      } catch (error) {
+        captionMessage.textContent = 'Could not confirm the save. Your text is still here; check the pool before retrying.';
+      }
+    });
+    wrap.querySelector('#xbs-caption-queue').addEventListener('click', () => {
+      const count = Number(captionCount.value);
+      if (!Number.isSafeInteger(count) || count < 1 || count > 1000) {
+        captionCount.setAttribute('aria-invalid', 'true');
+        captionMessage.textContent = 'Enter a whole number from 1 to 1000.';
+        captionCount.focus();
+        return;
+      }
+      if (captionText.value.trim()) {
+        captionMessage.textContent = 'Add or remove the unsaved caption text before queueing.';
+        captionText.focus();
+        return;
+      }
+      try {
+        if (!captions.all().pool.length) {
+          captionMessage.textContent = 'The caption pool is empty. Add captions first.';
+          return;
+        }
+        queueCaptions(count);
+        captionMessage.textContent = `Queued ${count} caption items. Tap Build to schedule them; nothing was posted.`;
+      } catch (error) {
+        captionMessage.textContent = 'Queueing could not be confirmed. Check the saved queue before retrying; some items may have been added.';
+      }
+    });
     wrap.querySelector('#xbs-min').addEventListener('click', () => {
       const body = wrap.querySelector('#xbs-body');
       body.style.display = body.style.display === 'none' ? 'block' : 'none';
