@@ -25,10 +25,9 @@
  *    so scheduled links are the live source, not a re-share that reads as dead.
  *  - Optional photo harvesting (panel "Photos" toggle, /photo/1 suffix).
  *  - Undo-last-harvest + Remove-by-link + Inspect (DOM dump) for bad links.
- * Picker MAPPED + implemented (native <select>s + Confirm on /compose/post/
- * schedule); timezone = WAT. Live posting still gated by CONFIG.dryRun (default
- * ON) — flip off only for the first confirmed 1-post live test. Delete tool
- * remains DRY-RUN scan only. See PROJECT.md / ROADMAP.md.
+ * Picker mapping is conservative and must be verified against the current X
+ * interface and its displayed timezone. Live posting remains gated by
+ * CONFIG.dryRun (default ON). Delete scan remains dry-run only.
  */
 
 (function () {
@@ -112,8 +111,8 @@
       tweetButton: '[data-testid="tweetButton"]',
       likeButton: '[data-testid="like"]',     // unliked heart; becomes "unlike" once liked
       // Schedule picker (mapped on-device 2026-09-26). Native <select>s on the
-      // x.com/compose/post/schedule route. Primary = X's ids; a heuristic
-      // fallback (findScheduleSelects) recovers them if the ids ever change.
+      // x.com/compose/post/schedule route. If these IDs or their option shapes
+      // change, stop instead of guessing which controls to use.
       schedule: {
         month: '#SELECTOR_1', day: '#SELECTOR_2', year: '#SELECTOR_3',
         hour: '#SELECTOR_4', minute: '#SELECTOR_5', ampm: '#SELECTOR_6',
@@ -121,10 +120,11 @@
     },
   };
 
-  // Picker mapped on-device 2026-09-26 (native selects + Confirm). Live posting
-  // is STILL gated by CONFIG.dryRun (default ON): flip that off only for the
-  // one confirmed live test. Setting this true just means the DOM path exists.
+  // Historical picker mapping; this alone is not evidence of the current
+  // picker shape or timezone.
   const SCHEDULER_MAPPED = true;
+  // Keep live scheduling blocked until the real picker timezone is verified.
+  const PICKER_TIMEZONE_VERIFIED = false;
 
   // The bookmark-remove control isn't DOM-mapped yet (needs an on-device Inspect
   // of the "•••" menu). Until it is, unbookmark-after-post only PREVIEWS in the
@@ -1003,44 +1003,40 @@
     return true;
   }
 
-  const optMax = (sel) => Math.max(...[...sel.options].map((o) => Number(o.textContent) || 0));
-
-  // Resolve the 6 selects. Prefer X's ids; if those miss, classify by option
-  // signature so a future id change doesn't break scheduling.
+  // Resolve only uniquely identified selects with recognisable option shapes.
+  // Never guess a replacement control from a potentially ambiguous page.
   function findScheduleSelects() {
     const S = CONFIG.selectors.schedule;
-    const byId = {
-      month: document.querySelector(S.month), day: document.querySelector(S.day),
-      year: document.querySelector(S.year), hour: document.querySelector(S.hour),
-      minute: document.querySelector(S.minute), ampm: document.querySelector(S.ampm),
-    };
-    if (Object.values(byId).every(Boolean)) return byId;
-    const sels = [...document.querySelectorAll('select')];
     const out = { month: null, day: null, year: null, hour: null, minute: null, ampm: null };
-    sels.forEach((s) => {
-      const texts = [...s.options].map((o) => o.textContent.trim());
-      if (texts.includes('December')) out.month = s;
-      else if (texts.includes('AM') || texts.includes('PM')) out.ampm = s;
-      else if (texts.some((t) => /^20\d\d$/.test(t))) out.year = s;
-      else if (optMax(s) >= 32) out.minute = s;
-      else if (optMax(s) <= 12) out.hour = s;
-      else out.day = s;
-    });
+    for (const key of Object.keys(out)) {
+      const found = [...document.querySelectorAll(S[key])];
+      if (found.length !== 1 || found[0].tagName !== 'SELECT') return out;
+      out[key] = found[0];
+    }
+    const texts = (s) => [...s.options].map((o) => o.textContent.trim());
+    const numbers = (s) => texts(s).filter((t) => /^\d+$/.test(t)).map(Number);
+    const day = numbers(out.day), hour = numbers(out.hour), minute = numbers(out.minute);
+    const valid = new Set(Object.values(out)).size === 6
+      && MONTHS.every((m) => texts(out.month).includes(m))
+      && day.includes(1) && Math.max(...day) >= 28 && Math.max(...day) <= 31
+      && hour.includes(1) && Math.max(...hour) === 12
+      && minute.includes(0) && Math.max(...minute) === 59
+      && texts(out.year).some((t) => /^20\d\d$/.test(t))
+      && ['AM', 'PM'].every((t) => texts(out.ampm).includes(t));
+    if (!valid) return { month: null, day: null, year: null, hour: null, minute: null, ampm: null };
     return out;
   }
 
-  // Find a clickable element by exact visible text (e.g. "Confirm").
-  function findByText(text) {
-    return [...document.querySelectorAll('[role="button"], button, [data-testid]')]
-      .find((el) => (el.textContent || '').trim() === text) || null;
-  }
-
-  // Open the picker (if needed), set all six selects to the WAT wall-clock time
-  // of whenISO, then click Confirm. The device is on WAT and the picker is WAT,
-  // so local getters map 1:1 (verified Check 3). Throws on any missing field.
-  async function setSchedulePicker(whenISO) {
+  // Open the picker and set the browser-local wall-clock representation of the instant.
+  // Actual picker timezone/field mapping still needs real-X verification.
+  async function setSchedulePicker(whenISO, pickerTimezoneVerified = PICKER_TIMEZONE_VERIFIED) {
     if (!SCHEDULER_MAPPED) throw new Error('Schedule picker not mapped.');
+    // No real-X timezone evidence is available for this build. The normal
+    // caller does not opt in, so live scheduling remains blocked. The test
+    // hook may pass true only for its known fictional picker.
+    if (!pickerTimezoneVerified) throw new Error('Picker timezone has not been verified for this build.');
     const d = new Date(whenISO);
+    if (!Number.isFinite(d.getTime())) throw new Error('Invalid scheduled instant.');
     // Open the schedule route if the selects aren't already present.
     if (!document.querySelector(CONFIG.selectors.schedule.month)) {
       const btn = document.querySelector(CONFIG.selectors.scheduleButton);
@@ -1051,21 +1047,39 @@
     const s = findScheduleSelects();
     const missing = Object.entries(s).filter(([, v]) => !v).map(([k]) => k);
     if (missing.length) throw new Error('picker fields missing: ' + missing.join(','));
+    const dialog = s.month.closest('[role="dialog"]');
+    if (!dialog || Object.values(s).some((el) => el.closest('[role="dialog"]') !== dialog))
+      throw new Error('picker controls are not in one unambiguous dialog');
 
-    const hour12 = ((d.getHours() + 11) % 12) + 1;
-    const ampm = d.getHours() < 12 ? 'AM' : 'PM';
+    const parts = Object.fromEntries(new Intl.DateTimeFormat('en-US', {
+      year: 'numeric', month: 'numeric', day: 'numeric',
+      hour: 'numeric', minute: 'numeric', hourCycle: 'h23',
+    }).formatToParts(d).map((p) => [p.type, p.value]));
+    const localHour = Number(parts.hour);
+    const hour12 = ((localHour + 11) % 12) + 1;
+    const ampm = localHour < 12 ? 'AM' : 'PM';
     // Set year+month first so the day option list matches that month, then day.
     const steps = [
-      [s.year, d.getFullYear()], [s.month, MONTHS[d.getMonth()]], [s.day, d.getDate()],
-      [s.hour, hour12], [s.minute, pad2(d.getMinutes())], [s.ampm, ampm],
+      [s.year, Number(parts.year)], [s.month, MONTHS[Number(parts.month) - 1]], [s.day, Number(parts.day)],
+      [s.hour, hour12], [s.minute, pad2(Number(parts.minute))], [s.ampm, ampm],
     ];
     for (const [sel, val] of steps) {
+      if (!sel.isConnected) throw new Error('picker changed during selection');
       if (!selectOption(sel, val)) throw new Error(`could not set ${val} on a picker select`);
       await sleep(120);
+      const selected = sel.selectedOptions[0];
+      const actual = selected && selected.textContent.trim();
+      if (!sel.isConnected || !selected || (actual !== String(val)
+          && (!/^\d+$/.test(actual) || Number(actual) !== Number(val))))
+        throw new Error('picker selection changed or could not be verified');
     }
-    const confirm = findByText('Confirm');
-    if (!confirm) throw new Error('Confirm button not found');
-    confirm.click();
+    if (Object.entries(s).some(([key, el]) => findScheduleSelects()[key] !== el))
+      throw new Error('picker mapping changed before confirmation');
+    const confirms = [...dialog.querySelectorAll('button, [role="button"]')]
+      .filter((el) => (el.textContent || '').trim() === 'Confirm' && el.getClientRects().length
+        && !el.disabled && el.getAttribute('aria-disabled') !== 'true');
+    if (confirms.length !== 1) throw new Error('Confirm button missing or ambiguous');
+    confirms[0].click();
     await sleep(jitter(800, 500));
     return true;
   }
@@ -1075,6 +1089,7 @@
     log(`${CONFIG.dryRun ? '[dryRun] ' : ''}scheduling ${item.kind || 'link'} ${item.id} for ${item.scheduledAt}`);
     if (CONFIG.dryRun) { item.state = 'scheduled'; store.upsert(item); return true; }
     if (!SCHEDULER_MAPPED) { log('Live run blocked: run TESTING.md first.', 'warn'); return false; }
+    if (!PICKER_TIMEZONE_VERIFIED) { log('Live run blocked: picker timezone has not been verified.', 'warn'); return false; }
     // Live path (enabled only after tests) --------------------------------
     location.assign('https://x.com/compose/post');
     await sleep(jitter(2500, 1500));
@@ -1104,6 +1119,10 @@
 
   async function runSchedule() {
     if (RUNNING) { log('Already running.', 'warn'); return; }
+    if (!CONFIG.dryRun && !PICKER_TIMEZONE_VERIFIED) {
+      log('Live run blocked: picker timezone has not been verified.', 'warn');
+      return;
+    }
     RUNNING = true;
     try {
       const items = store.getQueue()
@@ -2115,7 +2134,7 @@
       CONFIG, store, selfTest, buildSchedule, shuffleQueue, spreadShuffleQueue,
       spreadSameAuthor, authorOf, isSchedulable, isPhotoItem, buildSearchUrl,
       synToken, originalFromSyndication, isTombstone, buildUrl, extractStatusId,
-      statusSummary,
+      statusSummary, findScheduleSelects, setSchedulePicker,
       // v0.11.0: account scoping + general queue + community planner
       scopedKey, setAccount, getAccount: () => ACCOUNT,
       getGeneral, setGeneral, generalAdd, generalPull,
