@@ -1,0 +1,155 @@
+--- a/src/x-bulk-scheduler.user.js
++++ b/src/x-bulk-scheduler.user.js
+@@ -452,10 +452,11 @@
+     return !!article.querySelector(CONFIG.selectors.videoPlayer);
+   }
+ 
+-  // Dead posts render as "tombstones" with no media and unavailable text.
+-  const TOMBSTONE_RE = /(this post was deleted|this post is unavailable|no longer exists|account.*suspended)/i;
+-  function isTombstone(article) {
+-    return !isVideoPost(article) && TOMBSTONE_RE.test(article.innerText || '');
++  // Article text can be authored or belong to a quoted post. It is not
++  // reliable evidence that the parent is deleted. Until a verified classifier
++  // exists, treat all such cases as unknown rather than dead.
++  function isTombstone(_article) {
++    return false;
+   }
+ 
+   function collectFromView(source, seen, out, stats) {
+@@ -708,9 +709,9 @@
+   // ------------------------------------------------- DEAD-LINK CHECK (oEmbed)
+   // Layer 2: ping oEmbed; dead posts historically returned 404. No API key.
+   // 2026-09-23: publish.x.com/oembed now returns 402 (paywalled) to our tests,
+-  // so this is OFF by default (CONFIG.useOembedCheck). Layer 1 (tombstone during
+-  // harvest) is the free primary check. Re-verify from a logged-in browser in
+-  // DESKTOP-TESTING.md; if it works there, flip useOembedCheck on.
++  // so this is OFF by default (CONFIG.useOembedCheck). Article text is not a
++  // reliable deletion signal; no confirmed-dead classifier is currently active.
++  // A failed lookup does not establish deletion.
+   function oembedCheck(id, author) {
+     return new Promise((resolve) => {
+       if (!CONFIG.useOembedCheck) { resolve(true); return; } // skip → treat alive
+@@ -1636,10 +1637,10 @@
+       ok('syn same-id -> null', originalFromSyndication({ quoted_tweet: { id_str: '111' } }, '111') === null);
+       ok('synToken format', (() => { const t = synToken('1234567890123456789');
+         return typeof t === 'string' && t.length > 0 && !/[0.]/.test(t); })());
+-      // -- dead-link (tombstone) regex --
++      // -- untrusted article text does not prove parent deletion --
+       const fakeArt = (txt, hasVideo) => ({
+         querySelector: (s) => (hasVideo && /video/i.test(s)) ? {} : null, innerText: txt });
+-      ok('tombstone dead', isTombstone(fakeArt('This post was deleted.', false)) === true);
++      ok('unavailable wording is inconclusive', isTombstone(fakeArt('This post was deleted.', false)) === false);
+       ok('tombstone alive', isTombstone(fakeArt('This post was deleted.', true)) === false);
+       // -- picture parking / isSchedulable --
+       CONFIG.mixPictures = false;
+@@ -2592,7 +2593,7 @@
+     module.exports = {
+       CONFIG, store, saveSettings, toggleSavedSetting, selfTest, buildSchedule, shuffleQueue, spreadShuffleQueue,
+       spreadSameAuthor, authorOf, isSchedulable, isPhotoItem, buildSearchUrl,
+-      synToken, originalFromSyndication, inspectSyndication, resolveQueueLinks, harvest, resolveEmbeddedStatus, isTombstone, buildUrl, extractStatusId,
++      synToken, originalFromSyndication, inspectSyndication, resolveQueueLinks, harvest, collectFromView, resolveEmbeddedStatus, isTombstone, buildUrl, extractStatusId,
+       statusSummary, watParts, previewPlanKey, previewMatches, schedulePost, runSchedule, setSchedulePicker, validateTiming, commitTiming, previewPlanSafe, planningSettingsKey, planRecordKey, buildSchedule, pickComposerBox, insertIntoComposer, panic, likeVisible, postCommunityStep,
+       // v0.11.0: account scoping + general queue + community planner
+       scopedKey, setAccount, requireVisibleAccount, detectAccount, getAccount: () => ACCOUNT,
+--- a/extension/content.js
++++ b/extension/content.js
+@@ -529,10 +529,11 @@
+     return !!article.querySelector(CONFIG.selectors.videoPlayer);
+   }
+ 
+-  // Dead posts render as "tombstones" with no media and unavailable text.
+-  const TOMBSTONE_RE = /(this post was deleted|this post is unavailable|no longer exists|account.*suspended)/i;
+-  function isTombstone(article) {
+-    return !isVideoPost(article) && TOMBSTONE_RE.test(article.innerText || '');
++  // Article text can be authored or belong to a quoted post. It is not
++  // reliable evidence that the parent is deleted. Until a verified classifier
++  // exists, treat all such cases as unknown rather than dead.
++  function isTombstone(_article) {
++    return false;
+   }
+ 
+   function collectFromView(source, seen, out, stats) {
+@@ -785,9 +786,9 @@
+   // ------------------------------------------------- DEAD-LINK CHECK (oEmbed)
+   // Layer 2: ping oEmbed; dead posts historically returned 404. No API key.
+   // 2026-09-23: publish.x.com/oembed now returns 402 (paywalled) to our tests,
+-  // so this is OFF by default (CONFIG.useOembedCheck). Layer 1 (tombstone during
+-  // harvest) is the free primary check. Re-verify from a logged-in browser in
+-  // DESKTOP-TESTING.md; if it works there, flip useOembedCheck on.
++  // so this is OFF by default (CONFIG.useOembedCheck). Article text is not a
++  // reliable deletion signal; no confirmed-dead classifier is currently active.
++  // A failed lookup does not establish deletion.
+   function oembedCheck(id, author) {
+     return new Promise((resolve) => {
+       if (!CONFIG.useOembedCheck) { resolve(true); return; } // skip → treat alive
+@@ -1713,10 +1714,10 @@
+       ok('syn same-id -> null', originalFromSyndication({ quoted_tweet: { id_str: '111' } }, '111') === null);
+       ok('synToken format', (() => { const t = synToken('1234567890123456789');
+         return typeof t === 'string' && t.length > 0 && !/[0.]/.test(t); })());
+-      // -- dead-link (tombstone) regex --
++      // -- untrusted article text does not prove parent deletion --
+       const fakeArt = (txt, hasVideo) => ({
+         querySelector: (s) => (hasVideo && /video/i.test(s)) ? {} : null, innerText: txt });
+-      ok('tombstone dead', isTombstone(fakeArt('This post was deleted.', false)) === true);
++      ok('unavailable wording is inconclusive', isTombstone(fakeArt('This post was deleted.', false)) === false);
+       ok('tombstone alive', isTombstone(fakeArt('This post was deleted.', true)) === false);
+       // -- picture parking / isSchedulable --
+       CONFIG.mixPictures = false;
+@@ -2669,7 +2670,7 @@
+     module.exports = {
+       CONFIG, store, saveSettings, toggleSavedSetting, selfTest, buildSchedule, shuffleQueue, spreadShuffleQueue,
+       spreadSameAuthor, authorOf, isSchedulable, isPhotoItem, buildSearchUrl,
+-      synToken, originalFromSyndication, inspectSyndication, resolveQueueLinks, harvest, resolveEmbeddedStatus, isTombstone, buildUrl, extractStatusId,
++      synToken, originalFromSyndication, inspectSyndication, resolveQueueLinks, harvest, collectFromView, resolveEmbeddedStatus, isTombstone, buildUrl, extractStatusId,
+       statusSummary, watParts, previewPlanKey, previewMatches, schedulePost, runSchedule, setSchedulePicker, validateTiming, commitTiming, previewPlanSafe, planningSettingsKey, planRecordKey, buildSchedule, pickComposerBox, insertIntoComposer, panic, likeVisible, postCommunityStep,
+       // v0.11.0: account scoping + general queue + community planner
+       scopedKey, setAccount, requireVisibleAccount, detectAccount, getAccount: () => ACCOUNT,
+--- a/test/run-all.sh
++++ b/test/run-all.sh
+@@ -2,7 +2,7 @@
+ set -euo pipefail
+ cd "$(dirname "$0")/.."
+ for f in src/x-bulk-scheduler.user.js extension/content.js extension/simple-ui.js extension/background.js test/offline-browser.mjs; do node --check "$f"; done
+-for t in source-url-literal source-expanded-video strict-plan-timestamps whole-plan-status ui-whole-plan whole-plan-parity preview-eligibility-count ui-preview-eligibility shuffle-plan-proof-cleanup status-next-eligibility adapter-direct-writer-limit bundle-integrity selftest selftest-no-writes selftest-isolation selftest-repeat plan-cleanup legacy-plan-reservation legacy-plan-property extended-regression schedule-property spread-stability source-evidence source-ambiguity dom-source resolver resolver-preservation resolver-concurrency stop-epoch unknown-account harvest-safety storage-integrity settings-preservation settings-targeted-save settings-toggle-conflict timing-save timing-external-conflict queue-validation log-failure composer-settle composer-ambiguity preview-integrity picker-safety ui-identity ui-queue-counts ui-refresh-race ui-preview-current ui-plan-basis-parity ui-activity ui-static adapter-cas adapter-pending adapter-action-guard adapter-client adapter-observer adapter-startup-snapshot preview-storage-fault preview-stop preview-race preview-inconclusive like-stop run-safety run-concurrency preview-plan-guard preview-plan-basis preview-current-count preview-external-count preview-external-settings build-external-settings preview-lock action-locks blocked-prompts; do
++for t in availability-f14 source-url-literal source-expanded-video strict-plan-timestamps whole-plan-status ui-whole-plan whole-plan-parity preview-eligibility-count ui-preview-eligibility shuffle-plan-proof-cleanup status-next-eligibility adapter-direct-writer-limit bundle-integrity selftest selftest-no-writes selftest-isolation selftest-repeat plan-cleanup legacy-plan-reservation legacy-plan-property extended-regression schedule-property spread-stability source-evidence source-ambiguity dom-source resolver resolver-preservation resolver-concurrency stop-epoch unknown-account harvest-safety storage-integrity settings-preservation settings-targeted-save settings-toggle-conflict timing-save timing-external-conflict queue-validation log-failure composer-settle composer-ambiguity preview-integrity picker-safety ui-identity ui-queue-counts ui-refresh-race ui-preview-current ui-plan-basis-parity ui-activity ui-static adapter-cas adapter-pending adapter-action-guard adapter-client adapter-observer adapter-startup-snapshot preview-storage-fault preview-stop preview-race preview-inconclusive like-stop run-safety run-concurrency preview-plan-guard preview-plan-basis preview-current-count preview-external-count preview-external-settings build-external-settings preview-lock action-locks blocked-prompts; do
+   printf '\n--- %s ---\n' "$t"
+   node "test/$t.node.js"
+ done
+--- /dev/null
++++ b/test/availability-f14.node.js
+@@ -0,0 +1,35 @@
++const fs = require('fs');
++const assert = require('node:assert/strict');
++const source = fs.readFileSync(process.argv[2] || require('path').join(__dirname,'../src/x-bulk-scheduler.user.js'), 'utf8');
++const mem = {};
++global.GM_getValue = (k,d) => k in mem ? mem[k] : d;
++global.GM_setValue = (k,v) => { mem[k] = v; };
++global.GM_xmlhttpRequest = () => {};
++function stub() { const e = {style:{},dataset:{},options:[]}; e.querySelector=()=>stub(); e.querySelectorAll=()=>[]; e.addEventListener=()=>{}; e.appendChild=()=>{}; e.setAttribute=()=>{}; e.getAttribute=()=>null; e.closest=()=>null; e.click=()=>{}; e.focus=()=>{}; e.remove=()=>{}; e.dispatchEvent=()=>true; return e; }
++global.document={getElementById:()=>null,querySelector:()=>stub(),querySelectorAll:()=>[],createElement:()=>stub(),body:stub(),documentElement:stub(),addEventListener:()=>{},execCommand:()=>true};
++global.window=global; global.location={pathname:'/home',href:'https://x.com/home',assign:()=>{}};global.MutationObserver=class{observe(){} disconnect(){}};global.confirm=()=>false;global.prompt=()=>null;global.InputEvent=class{};global.Event=class{};
++const mod={exports:{}};new Function('module','exports',source)(mod,mod.exports);
++// A valid photo post whose own ordinary text mentions an unavailable post.
++// Text alone must not make the parent post a confirmed dead tombstone.
++const article={innerText:'This post is unavailable as an example; here is a photo.',querySelector:s=>s.includes('tweetPhoto') ? {} : null};
++assert.equal(mod.exports.isTombstone(article),false,'authored text plus a visible photo is not proof the parent is dead');
++console.log('PASS: authored text is not classified as a dead post');
++
++const {isTombstone, collectFromView, CONFIG} = mod.exports;
++function post(id, text, kind) {
++ const anchor = {getAttribute:()=>`/synthetic/status/${id}`};
++ return {innerText:text, querySelector:s=>s==='time'?{closest:()=>anchor}:(s===CONFIG.selectors.tweetPhoto && kind==='photo') || (s===CONFIG.selectors.videoPlayer && kind==='video') ? {}:null, querySelectorAll:()=>[]};
++}
++const items=[post('111','This post was deleted, but here is my photo','photo'), post('222','Quoted: This post is unavailable','video'), post('333','This post was deleted','none'), post('444','ordinary text','none')];
++for (const item of items) assert.equal(isTombstone(item),false,'article text cannot establish parent deletion');
++document.querySelectorAll=s=>s===CONFIG.selectors.article?items:[];
++CONFIG.harvestPhotos=true;
++const out=[], stats={domArticles:0,scanned:0,noId:0,tombstone:0,noMedia:0,photoSkip:0,resolved:0,queued:0,alreadyHad:0,cap:Infinity};
++collectFromView('bookmarks',new Set(),out,stats);
++assert.deepEqual(out.map(x=>x.id),['111','222'],'matching media survives; no-media posts remain excluded');
++assert.equal(stats.tombstone,0); assert.equal(stats.noMedia,2);
++CONFIG.harvestPhotos=false;
++const out2=[], stats2={domArticles:0,scanned:0,noId:0,tombstone:0,noMedia:0,photoSkip:0,resolved:0,queued:0,alreadyHad:0,cap:Infinity};
++collectFromView('bookmarks',new Set(),out2,stats2);
++assert.deepEqual(out2.map(x=>x.id),['222']); assert.equal(stats2.photoSkip,1); assert.equal(stats2.noMedia,2);
++console.log('PASS: media collection and inconclusive wording, including photo setting; no-media posts remain excluded');
