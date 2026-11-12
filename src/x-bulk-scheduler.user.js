@@ -26,7 +26,7 @@
  *  - Optional photo harvesting (panel "Photos" toggle, /photo/1 suffix).
  *  - Undo-last-harvest + Remove-by-link + Inspect (DOM dump) for bad links.
  * Picker MAPPED + implemented (native <select>s + Confirm on /compose/post/
- * schedule); timezone = WAT. Live posting still gated by CONFIG.dryRun (default
+ * schedule); browser-local planner is proposed, actual picker is unverified. Live posting still gated by CONFIG.dryRun (default
  * ON) — flip off only for the first confirmed 1-post live test. Delete tool
  * remains DRY-RUN scan only. See PROJECT.md / ROADMAP.md.
  */
@@ -41,7 +41,7 @@
       '10x5': { postsPerSession: 10, sessions: 5, sessionHours: 5, gapSeconds: 30 },
     },
     active: '12x4',        // default preset; switch to '10x5' any time
-    startTime: '00:00',     // first session each day, WAT (Nigeria, UTC+1)
+    startTime: '00:00',     // first session each day in browser-local time
     gapMinutes: 0,          // SPACE BETWEEN POSTS, in minutes. 0 (default) = keep
                             //   the preset's session bursts (tight gapSeconds within
                             //   a session, sessionHours between sessions). Set > 0
@@ -908,54 +908,91 @@
   const isPhotoItem = (x) => x.media === 'photo';
   const isSchedulable = (x) => !isPhotoItem(x) || CONFIG.mixPictures;
 
-  // Pure, local, no DOM, no network. Splits queued items into day/session/slot
-  // and stamps each with a WAT timestamp. Idempotent: re-runnable any time.
-  function buildSchedule() {
-    const p = CONFIG.presets[CONFIG.active];
-    const perDay = p.postsPerSession * p.sessions;
-    const all = store.getQueue().filter((x) => x.state === 'queued');
-    const queue = all.filter(isSchedulable);
-    const parkedPics = all.length - queue.length;
-    if (!queue.length) {
-      log(parkedPics
-        ? `Nothing schedulable — ${parkedPics} picture(s) are parked. Turn Mix Pics ON to include them.`
-        : 'Nothing queued to schedule.', 'warn');
-      return;
+  // Return the unique instant for a browser-local wall minute. Sampling every
+  // minute across nearby days collects candidate offsets, and round-tripping
+  // rejects DST gaps and folds instead of silently choosing an occurrence.
+  function localMinute(dayUtc, minute, cache) {
+    const wall = dayUtc + minute * 60000;
+    const expected = new Date(wall);
+    let offsets = cache.get(dayUtc);
+    if (!offsets) {
+      offsets = new Set();
+      for (let t = dayUtc - 36 * 3600000; t <= dayUtc + 60 * 3600000; t += 60000)
+        offsets.add(new Date(t).getTimezoneOffset());
+      cache.set(dayUtc, offsets);
     }
-
-    const [sh, sm] = CONFIG.startTime.split(':').map(Number);
-    const evenGapMin = Math.max(0, Math.floor(Number(CONFIG.gapMinutes) || 0));
-    let n = 0;
-    const cap = Math.min(queue.length, CONFIG.daysAhead * perDay, CONFIG.dailyCap * CONFIG.daysAhead);
-    for (let i = 0; i < cap; i++) {
-      const item = queue[i];
-      const day = Math.floor(n / perDay);
-      const within = n % perDay;
-      const session = Math.floor(within / p.postsPerSession);
-      const slot = within % p.postsPerSession;
-
-      const d = new Date();
-      d.setDate(d.getDate() + day);
-      d.setHours(sh, sm, 0, 0);
-      if (evenGapMin > 0) {
-        // Steady drip: every post evenGapMin minutes apart from startTime.
-        // Sessions/slots still recorded for reference but don't shape the time.
-        d.setMinutes(d.getMinutes() + within * evenGapMin);
-      } else {
-        // Preset session bursts: sessionHours between sessions, gapSeconds within.
-        // (jittered spacing handled at run time)
-        d.setHours(d.getHours() + session * p.sessionHours);
-        d.setSeconds(d.getSeconds() + slot * p.gapSeconds);
+    const matches = [];
+    for (const offset of offsets) {
+      const instant = wall + offset * 60000, d = new Date(instant);
+      if (d.getFullYear() === expected.getUTCFullYear() && d.getMonth() === expected.getUTCMonth() &&
+          d.getDate() === expected.getUTCDate() && d.getHours() === expected.getUTCHours() &&
+          d.getMinutes() === expected.getUTCMinutes()) matches.push(instant);
+    }
+    return matches.length === 1 ? matches[0] : null;
+  }
+  function localDayKey(ms) {
+    const d = new Date(ms);
+    return `${d.getFullYear()}-${d.getMonth()+1}-${d.getDate()}`;
+  }
+  // Proposed browser-local planner; ambiguous wall times fail closed. This is
+  // not proof of what X's picker will ultimately save.
+  function buildSchedule(nowMs = Date.now()) {
+    const validTime = typeof CONFIG.startTime === 'string' && /^(?:[01]?\d|2[0-3]):[0-5]\d(?![\s\S])/.test(CONFIG.startTime);
+    const validInteger = (v, min, max) => Number.isSafeInteger(v) && v >= min && v <= max;
+    const p = Object.prototype.hasOwnProperty.call(CONFIG.presets, CONFIG.active) ? CONFIG.presets[CONFIG.active] : null;
+    if (!Number.isFinite(nowMs) || !validTime || !validInteger(CONFIG.gapMinutes, 0, 1440) ||
+        !validInteger(CONFIG.daysAhead, 1, 366) || !validInteger(CONFIG.dailyCap, 1, 1000) ||
+        !p || !validInteger(p.postsPerSession, 1, 1000) || !validInteger(p.sessions, 1, 1000) ||
+        !validInteger(p.sessionHours, 0, 24) || !validInteger(p.gapSeconds, 0, 86400)) {
+      log('Invalid timing settings. Existing plan and settings were not changed.', 'warn'); return;
+    }
+    const records = store.getQueue();
+    const counts = new Map(), occupied = new Set();
+    for (const item of records) if (item.state === 'scheduled') {
+      const text = item.scheduledAt;
+      const t = typeof text === 'string' && /^\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d{1,3})?)?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/i.test(text) ? Date.parse(text) : NaN;
+      const dateText = typeof text === 'string' ? text.slice(0, 10) : '';
+      const datePart = Date.parse(dateText + 'T00:00:00Z');
+      if (!Number.isFinite(t) || !Number.isFinite(datePart) || new Date(datePart).toISOString().slice(0, 10) !== dateText) {
+        log('A previous scheduled marker has an unknown time; existing plan was not changed.', 'warn'); return;
       }
-
-      item.day = day; item.session = session; item.slot = slot;
-      item.scheduledAt = d.toISOString();
-      store.upsert(item);
-      n++;
+      const key = localDayKey(t); counts.set(key, (counts.get(key) || 0) + 1); occupied.add(Math.floor(t / 60000));
     }
-    const spacing = evenGapMin > 0 ? `${evenGapMin} min apart (drip)` : `${CONFIG.active} bursts`;
-    log(`Schedule built: ${cap} posts across ${Math.ceil(cap / perDay)} day(s), ${spacing}.`
-      + (parkedPics ? `  (${parkedPics} picture(s) parked — Mix Pics is OFF.)` : ''));
+    const [sh, sm] = CONFIG.startTime.split(':').map(Number), minuteStart = sh * 60 + sm;
+    const now = new Date(nowMs), dayMs = 86400000;
+    let firstDay = Date.UTC(now.getFullYear(), now.getMonth(), now.getDate());
+    const offsetCache = new Map();
+    const first = localMinute(firstDay, minuteStart, offsetCache);
+    if (first === null) { log('Start time is ambiguous or does not exist in the browser timezone; plan was not changed.', 'warn'); return; }
+    if (first <= nowMs) firstDay += dayMs;
+    const perDay = p.postsPerSession * p.sessions, cap = Math.min(perDay, CONFIG.dailyCap);
+    const burstGap = Math.max(1, Math.ceil(p.gapSeconds / 60));
+    const queued = records.filter(x => x.state === 'queued');
+    const queue = queued.filter(isSchedulable), assignments = [];
+    let cursor = 0, usedDays = 0, last = -Infinity;
+    for (let day = 0; day < CONFIG.daysAhead && cursor < queue.length; day++) {
+      const dayUtc = firstDay + day * dayMs, keyDate = new Date(dayUtc);
+      const key = `${keyDate.getUTCFullYear()}-${keyDate.getUTCMonth()+1}-${keyDate.getUTCDate()}`;
+      let count = counts.get(key) || 0, planned = 0;
+      for (let within = 0; within < perDay && count < cap && cursor < queue.length; within++) {
+        const session = Math.floor(within / p.postsPerSession), slot = within % p.postsPerSession;
+        const minute = minuteStart + (CONFIG.gapMinutes ? within * CONFIG.gapMinutes : session * p.sessionHours * 60 + slot * burstGap);
+        if (minute >= 1440) continue;
+        const t = localMinute(dayUtc, minute, offsetCache);
+        if (t === null) { log('A planned time is ambiguous or does not exist in the browser timezone; plan was not changed.', 'warn'); return; }
+        if (t <= nowMs || occupied.has(Math.floor(t / 60000))) continue;
+        if (t <= last) { log('The generated times are not strictly increasing; plan was not changed.', 'warn'); return; }
+        assignments.push({item:queue[cursor++],day,session,slot,time:new Date(t).toISOString()});
+        occupied.add(Math.floor(t / 60000)); last = t; count++; planned++;
+      }
+      if (planned) usedDays++;
+    }
+    for (const item of queued) { item.scheduledAt = null; item.day = 0; item.session = 0; item.slot = 0; }
+    for (const x of assignments) Object.assign(x.item,{scheduledAt:x.time,day:x.day,session:x.session,slot:x.slot});
+    store.setQueue(records);
+    log(`Schedule built: ${assignments.length} posts across ${usedDays} day(s), browser-local time.` +
+      (queue.length > assignments.length ? ` ${queue.length - assignments.length} waiting without a time.` : '') +
+      (queued.length > queue.length ? ` ${queued.length - queue.length} picture(s) parked.` : ''));
   }
 
   // ---------------------------------------------------- COMPOSER INSERT
@@ -1035,9 +1072,9 @@
       .find((el) => (el.textContent || '').trim() === text) || null;
   }
 
-  // Open the picker (if needed), set all six selects to the WAT wall-clock time
-  // of whenISO, then click Confirm. The device is on WAT and the picker is WAT,
-  // so local getters map 1:1 (verified Check 3). Throws on any missing field.
+  // Open the picker (if needed), set all six selects to the browser-local time
+  // of whenISO, then click Confirm. Actual X picker timezone and saved instant
+  // are unverified. Throws on any missing field.
   async function setSchedulePicker(whenISO) {
     if (!SCHEDULER_MAPPED) throw new Error('Schedule picker not mapped.');
     const d = new Date(whenISO);
@@ -1165,7 +1202,7 @@
     const nextAt = q.filter((x) => x.state === 'queued' && x.scheduledAt)
       .map((x) => x.scheduledAt).sort()[0];
     const nextStr = nextAt
-      ? new Date(nextAt).toLocaleString('en-GB', { timeZone: CONFIG.timezone })
+      ? new Date(nextAt).toLocaleString('en-GB')
       : '—';
     const p = CONFIG.presets[CONFIG.active];
     const perDay = p.postsPerSession * p.sessions;
@@ -1368,7 +1405,7 @@
     if (pr && CONFIG.presets[pr.trim()]) CONFIG.active = pr.trim();
     else if (pr && pr.trim()) { log(`Unknown preset "${pr.trim()}" — kept ${CONFIG.active}.`, 'warn'); }
 
-    const st = prompt(`Daily start time, 24h HH:MM (WAT).\nBlank = keep (${CONFIG.startTime}).`);
+    const st = prompt(`Daily start time, 24h HH:MM (browser local).\nBlank = keep (${CONFIG.startTime}).`);
     if (st && /^\d{1,2}:\d{2}$/.test(st.trim())) CONFIG.startTime = st.trim();
     else if (st && st.trim()) log(`"${st.trim()}" isn't HH:MM — kept ${CONFIG.startTime}.`, 'warn');
 
